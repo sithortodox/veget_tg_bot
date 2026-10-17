@@ -19,4 +19,16 @@ class SellerProduct(StatesGroup):
     price = State()
     unit = State()
     description = State()
-    photo = State()
+    photo = State()  # прикрепить фото карточки или «-»
+
+
+class SellerAssemble(StatesGroup):
+    """Фактическое количество при сборке (§5.1)."""
+
+    entering = State()  # ввод факта по очереди для каждой позиции
+
+
+class SellerReject(StatesGroup):
+    """Причина отмены своей части заказа (S6)."""
+
+    reason = State()

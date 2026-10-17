@@ -45,6 +45,18 @@ class GeocodeResult:
     provider: str = ""
 
 
+def point_from_wkt(wkt: str) -> GeoPoint:
+    """Разбирает WKT «POINT(lon lat)» → GeoPoint."""
+    inner = wkt[wkt.find("(") + 1 : wkt.find(")")]
+    lon_s, lat_s = inner.split()
+    return GeoPoint(lat=float(lat_s), lon=float(lon_s))
+
+
+def clamp_search_radius(value: int, min_m: int, max_m: int) -> int:
+    """Ограничивает пользовательский радиус поиска диапазоном G4 (300–800 м)."""
+    return max(int(min_m), min(int(max_m), int(value)))
+
+
 class GeocoderProvider(Protocol):
     """Протокол геокодера."""
 

@@ -29,10 +29,11 @@ from app.keyboards.client_kb import (
     time_keyboard,
 )
 from app.keyboards.common_kb import main_client_keyboard
+from app.services.geo import clamp_search_radius
 from app.services.order import OrderService
 from app.services.preorder import PreorderService
 from app.services.registry import ServiceRegistry
-from app.states.client_states import ClientOrder
+from app.states.client_states import ClientOrder, ClientProfile
 
 logger = logging.getLogger(__name__)
 router = Router(name="client")
@@ -96,9 +97,54 @@ async def menu_profile(message: Message, data: dict) -> None:
     await message.answer(
         f"👤 {db_user.name or '—'}\n"
         f"📱 {db_user.phone or '—'}\n"
-        f"📍 {db_user.address_text or '—'}\n\n"
-        "Для смены адреса: /start → регистрация заново.\n"
-        "Радиус поиска магазинов: 300–800 м."
+        f"📍 {db_user.address_text or '—'}\n"
+        f"🔍 Радиус поиска магазинов: {db_user.search_radius_m} м "
+        f"(можно 300–800, кнопка внизу).\n\n"
+        "Для смены адреса: /start → регистрация заново."
+    )
+
+
+# ----------------------------------------------------------------------
+# Радиус поиска (G4: 300–800 м, настраивается)
+# ----------------------------------------------------------------------
+
+
+@router.callback_query(F.data == "cprof:radius")
+async def profile_radius_ask(
+    cb: CallbackQuery, state: FSMContext, data: dict
+) -> None:
+    """Кнопка «Расширить радиус поиска» → просим ввести метры."""
+    settings = data["app_settings"]
+    db_user: User = data["db_user"]
+    await state.set_state(ClientProfile.radius)
+    await cb.answer()
+    await cb.message.answer(
+        f"🔍 Текущий радиус поиска: {db_user.search_radius_m} м.\n"
+        f"Введите новый радиус в метрах (от {settings.min_search_radius_m} "
+        f"до {settings.max_search_radius_m}):"
+    )
+
+
+@router.message(ClientProfile.radius, F.text)
+async def profile_radius_set(message: Message, state: FSMContext, data: dict) -> None:
+    """Сохраняем персональный радиус поиска (G4)."""
+    settings = data["app_settings"]
+    session: AsyncSession = data["session"]
+    db_user: User = data["db_user"]
+    try:
+        value = int(float(message.text.strip().replace("м", "").replace(",", ".")))
+    except ValueError:
+        await message.answer("Нужно число в метрах, например 600.")
+        return
+    value = clamp_search_radius(
+        value, settings.min_search_radius_m, settings.max_search_radius_m
+    )
+    db_user.search_radius_m = value
+    await session.flush()
+    await state.clear()
+    await message.answer(
+        f"✅ Радиус поиска магазинов: {value} м.",
+        reply_markup=main_client_keyboard(),
     )
 
 
@@ -120,7 +166,9 @@ async def order_list_received(message: Message, state: FSMContext, data: dict) -
         return
 
     await message.answer("🔍 Разбираю список и ищу магазины...")
-    order, text = await orders.create_from_text(session, db_user, message.text)
+    order, text = await orders.create_from_text(
+        session, db_user, message.text, radius_m=db_user.search_radius_m
+    )
     if order is None:
         await message.answer(text)
         return
@@ -201,7 +249,8 @@ async def order_date_entered(message: Message, state: FSMContext, data: dict) ->
         return
 
     order, text = await orders.create_from_text(
-        session, db_user, text_list, scheduled_at=scheduled
+        session, db_user, text_list,
+        scheduled_at=scheduled, radius_m=db_user.search_radius_m,
     )
     if order is None:
         await message.answer(text)
@@ -294,10 +343,25 @@ async def order_edit_hint(cb: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("od:"))
 async def order_delivery(cb: CallbackQuery, state: FSMContext, data: dict) -> None:
-    """Выбор способа получения → выбор оплаты."""
-    await cb.answer()
+    """Выбор способа получения → выбор оплаты (проверка зоны доставки §6.3)."""
+    services: ServiceRegistry = data["services"]
+    session: AsyncSession = data["session"]
+    orders: OrderService = services["orders"]
+    delivery_service = services["delivery"]
     _, order_id_s, delivery = cb.data.split(":")
     order_id = int(order_id_s)
+
+    # Доставка: сначала проверяем, что адрес в радиусе доставки
+    if delivery == DeliveryType.COURIER.value:
+        order = await orders.get_order(session, order_id)
+        if order is None:
+            await cb.answer("Заказ не найден", show_alert=True)
+            return
+        zone_error = delivery_service.zone_error_for_order(order)
+        if zone_error is not None:
+            await cb.answer(zone_error, show_alert=True)
+            return
+
     await state.update_data(order_id=order_id, delivery_type=delivery)
     await state.set_state(ClientOrder.choosing_payment)
     extra = ""
@@ -326,13 +390,23 @@ async def order_payment(cb: CallbackQuery, state: FSMContext, data: dict) -> Non
     if order is None:
         await cb.message.edit_text("Заказ не найден.")
         return
-    await orders.client_approve(
-        session,
-        order,
-        delivery_type=delivery,
-        payment_method=payment,
-        changed_by=cb.from_user.id,
-    )
+    try:
+        await orders.client_approve(
+            session,
+            order,
+            delivery_type=delivery,
+            payment_method=payment,
+            changed_by=cb.from_user.id,
+        )
+    except ValueError as exc:
+        # Адрес вне зоны доставки (§6.3) — возвращаем к выбору получения
+        await cb.answer(str(exc), show_alert=True)
+        await cb.message.edit_text(
+            f"Заказ #{order_id}: доставка недоступна по адресу.",
+            reply_markup=delivery_keyboard(order_id),
+        )
+        await state.set_state(ClientOrder.choosing_delivery)
+        return
     await state.clear()
     await cb.message.edit_text(
         f"✅ Заказ #{order_id} утверждён! Магазины собирают — сообщу о готовности."

@@ -74,6 +74,40 @@ class Notifier:
         await session.flush()
         return ok
 
+    async def send_photo(
+        self,
+        session: AsyncSession,
+        telegram_id: int,
+        photo_file_id: str,
+        caption: Optional[str] = None,
+        keyboard: Keyboard = None,
+    ) -> bool:
+        """Отправляет фото (например, карточку товара покупателю)."""
+        try:
+            await self._bot.send_photo(
+                chat_id=telegram_id,
+                photo=photo_file_id,
+                caption=caption,
+                reply_markup=keyboard,
+            )
+            ok = True
+        except TelegramForbiddenError:
+            logger.info("Пользователь %s заблокировал бота", telegram_id)
+            ok = False
+        except Exception:  # noqa: BLE001
+            logger.exception("Ошибка отправки фото %s", telegram_id)
+            ok = False
+
+        session.add(
+            MessageLog(
+                user_id=telegram_id,
+                direction="out",
+                text=f"[photo] {caption or photo_file_id}"[:4000],
+            )
+        )
+        await session.flush()
+        return ok
+
     async def notify_shop(
         self,
         session: AsyncSession,

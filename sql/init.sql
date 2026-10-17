@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS users (
     ban_count INT DEFAULT 0,
     ban_reason TEXT,
     banned_at TIMESTAMPTZ,
+    search_radius_m INT NOT NULL DEFAULT 800,
     created_at TIMESTAMPTZ DEFAULT now()
 );
 

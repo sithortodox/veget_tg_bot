@@ -44,6 +44,10 @@ class User(Base):
     ban_count: Mapped[int] = mapped_column(Integer, default=0)
     ban_reason: Mapped[Optional[str]] = mapped_column(Text)
     banned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # Персональный радиус поиска магазинов, G4 (300–800 м), метры
+    search_radius_m: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=800, server_default="800"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

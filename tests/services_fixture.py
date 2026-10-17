@@ -80,6 +80,32 @@ class MockNotifier(Notifier):
         """Все тексты, отправленные указанному пользователю."""
         return [m["text"] for m in self.messages if m["telegram_id"] == telegram_id]
 
+    def photos_for(self, telegram_id: int) -> list[dict[str, Any]]:
+        """Все фото, отправленные указанному пользователю."""
+        return [
+            m for m in self.messages if m["telegram_id"] == telegram_id and m.get("photo")
+        ]
+
+    async def send_photo(
+        self,
+        session: AsyncSession,
+        telegram_id: int,
+        photo_file_id: str,
+        caption: Optional[str] = None,
+        keyboard: Optional[InlineKeyboardMarkup | ReplyKeyboardMarkup] = None,
+    ) -> bool:
+        """Фиксирует фото вместо отправки."""
+        self.messages.append(
+            {
+                "telegram_id": telegram_id,
+                "text": f"[photo] {caption or photo_file_id}",
+                "photo": photo_file_id,
+                "caption": caption,
+                "keyboard": keyboard,
+            }
+        )
+        return True
+
     def last_for(self, telegram_id: int) -> Optional[str]:
         """Последнее сообщение пользователю."""
         msgs = self.texts_for(telegram_id)

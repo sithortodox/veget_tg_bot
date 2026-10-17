@@ -321,15 +321,18 @@ class OrderService:
     @staticmethod
     def _point_from_wkt(wkt: str) -> GeoPoint:
         """POINT(lon lat) → GeoPoint."""
-        inner = wkt[wkt.find("(") + 1 : wkt.find(")")]
-        lon_s, lat_s = inner.split()
-        return GeoPoint(lat=float(lat_s), lon=float(lon_s))
+        from app.services.geo import point_from_wkt
+
+        return point_from_wkt(wkt)
 
     async def _recalc_total(self, session: AsyncSession, order: Order) -> float:
-        """Пересчёт предварительной суммы по подзаказам."""
+        """Пересчёт предварительной суммы по подзаказам (без отклонённых/отменённых)."""
         total = 0.0
         for sub in order.sub_orders:
-            if sub.status == SubOrderStatus.REJECTED.value:
+            if sub.status in (
+                SubOrderStatus.REJECTED.value,
+                SubOrderStatus.CANCELLED.value,
+            ):
                 continue
             total += float(sub.subtotal_estimated or 0)
         delivery = (
@@ -589,6 +592,13 @@ class OrderService:
             return
         self._scheduler.cancel(job_id_client_approve(order.id))
 
+        # Проверка зоны доставки (§6.3): адрес ≤ delivery_radius_m от магазинов
+        delivery = getattr(self, "_delivery", None)
+        if delivery_type == DeliveryType.COURIER.value and delivery is not None:
+            zone_error = delivery.zone_error_for_order(order)
+            if zone_error is not None:
+                raise ValueError(zone_error)
+
         order.delivery_type = delivery_type
         order.payment_method = payment_method
         if delivery_type == DeliveryType.COURIER.value:
@@ -680,8 +690,78 @@ class OrderService:
         sub_order.status = SubOrderStatus.READY.value
         sub_order.assembled_at = utcnow()
         await session.flush()
+        await self._finalize_if_all_ready(session, sub_order.order_id, changed_by=changed_by)
 
+    async def seller_cancels_part(
+        self,
+        session: AsyncSession,
+        sub_order: SubOrder,
+        reason: str = "",
+        changed_by: Optional[int] = None,
+    ) -> bool:
+        """Продавец отменяет свою часть заказа во время сборки (S6, «с причиной»).
+
+        Пересчитывает сумму, уведомляет покупателя; если живых позиций не
+        осталось — отменяет весь заказ. Если остались только готовые —
+        завершает сборку и уведомляет покупателя о готовности.
+        Возвращает False, если сейчас отменять нельзя.
+        """
         order = await self.get_order(session, sub_order.order_id)
+        if order is None or order.status != OrderStatus.ASSEMBLING.value:
+            return False
+        if sub_order.status not in (
+            SubOrderStatus.ASSEMBLING.value,
+            SubOrderStatus.CONFIRMED.value,
+        ):
+            return False
+
+        self._scheduler.cancel(job_id_assemble(order.id, sub_order.id))
+        sub_order.status = SubOrderStatus.CANCELLED.value
+        if reason:
+            for item in sub_order.items:
+                item.note = reason
+        await session.flush()
+
+        shop_name = sub_order.shop.name if sub_order.shop else "Магазин"
+        active = [
+            s
+            for s in order.sub_orders
+            if s.status
+            not in (SubOrderStatus.REJECTED.value, SubOrderStatus.CANCELLED.value)
+        ]
+        if not active:
+            # Ни одной живой позиции — заказ целиком
+            order.status = OrderStatus.CANCELLED.value
+            await self._log_status(session, order, changed_by=changed_by)
+            await session.flush()
+            await self._notifier.send(
+                session,
+                order.client.telegram_id,
+                f"❌ Заказ #{order.id} отменён: магазин «{shop_name}» отказался "
+                + (f"({reason})." if reason else "от своей части."),
+            )
+            return True
+
+        order.total_estimated = await self._recalc_total(session, order)
+        await session.flush()
+
+        warn = f"⚠️ Магазин «{shop_name}» отказался от своей части заказа #{order.id}"
+        if reason:
+            warn += f": {reason}"
+        warn += f".\n💰 Новая сумма ~{float(order.total_estimated or 0):.0f} ₽"
+        await self._notifier.send(session, order.client.telegram_id, warn)
+        # Остались только собранные? Завершаем сборку, иначе ждём остальных
+        await self._finalize_if_all_ready(session, order.id, changed_by=changed_by)
+        return True
+
+    async def _finalize_if_all_ready(
+        self,
+        session: AsyncSession,
+        order_id: int,
+        changed_by: Optional[int] = None,
+    ) -> None:
+        """Когда все подзаказы собраны (или исключены) — статус READY и уведомление."""
+        order = await self.get_order(session, order_id)
         if order is None:
             return
         # Все подзаказы готовы?
@@ -728,6 +808,29 @@ class OrderService:
             "\n".join(lines),
             keyboard=ready_keyboard(order.id),
         )
+        # Фото позиций (если продавцы прикрепили к карточкам) — §3.3 S2
+        seen: set[str] = set()
+        sent = 0
+        for s in order.sub_orders:
+            if s.status != SubOrderStatus.READY.value:
+                continue
+            for item in s.items:
+                product = item.product
+                file_id = product.photo_file_id if product else None
+                if not file_id or file_id in seen:
+                    continue
+                seen.add(file_id)
+                await self._notifier.send_photo(
+                    session,
+                    order.client.telegram_id,
+                    file_id,
+                    caption=f"🥕 {item.raw_name}",
+                )
+                sent += 1
+                if sent >= 3:
+                    break
+            if sent >= 3:
+                break
         # Таймер получения/оплаты
         self._scheduler.schedule_once(
             job_id_pickup(order.id),

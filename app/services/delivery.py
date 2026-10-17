@@ -32,6 +32,27 @@ class DeliveryService:
         """Доставка доступна, если адрес в радиусе доставки (§6.3)."""
         return haversine_m(client_point, shop_point) <= self._settings.delivery_radius_m
 
+    def zone_error_for_order(self, order: Order) -> Optional[str]:
+        """Текст ошибки, если адрес клиента вне зоны доставки хотя бы одного магазина.
+
+        None — всё в зоне, доставка возможна.
+        """
+        from app.services.geo import point_from_wkt
+
+        if not order.delivery_geo:
+            return "Не определён адрес доставки — укажите адрес в профиле."
+        client_point = point_from_wkt(order.delivery_geo)
+        for sub in order.sub_orders:
+            shop = sub.shop
+            if shop is None or not shop.address_geo:
+                continue
+            if not self.is_in_delivery_zone(client_point, point_from_wkt(shop.address_geo)):
+                return (
+                    f"📍 Адрес вне зоны доставки (радиус {self._settings.delivery_radius_m} м): "
+                    f"магазин «{shop.name}». Выберите самовывоз или сократите адрес."
+                )
+        return None
+
     @property
     def cost(self) -> float:
         """Фиксированная стоимость доставки из конфига."""
