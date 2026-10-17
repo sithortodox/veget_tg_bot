@@ -12,6 +12,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Interval,
     Integer,
     Numeric,
     String,
@@ -67,8 +68,9 @@ class Shop(Base):
     moderation_status: Mapped[str] = mapped_column(
         String(20), default="pending"
     )  # pending|approved|rejected
-    avg_response_time: Mapped[Optional[str]] = mapped_column(String(30))
-    avg_assemble_time: Mapped[Optional[str]] = mapped_column(String(30))
+    # Средние времена ответа и сборки (INTERVAL, как в init.sql §13)
+    avg_response_time: Mapped[Optional[object]] = mapped_column(Interval)
+    avg_assemble_time: Mapped[Optional[object]] = mapped_column(Interval)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
