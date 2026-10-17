@@ -151,7 +151,7 @@ async def stack(db, session_factory) -> ServiceStack:
     registry.register("notifier", notifier)
     registry.register("scheduler", scheduler)
 
-    return TestStack(
+    return ServiceStack(
         registry=registry,
         orders=orders,
         preorders=preorders,
