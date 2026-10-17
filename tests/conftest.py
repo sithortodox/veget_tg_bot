@@ -21,6 +21,9 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+# Фикстуры сервисного слоя (MockNotifier, FakeScheduler, stack)
+pytest_plugins = ["tests.services_fixture"]
+
 from app.db.base import Base
 from app.db.models import (
     BanHistory,

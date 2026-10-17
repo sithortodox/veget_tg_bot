@@ -228,10 +228,17 @@ class OrderService:
             payment_status=PaymentStatus.PENDING.value,
         )
         session.add(order)
+        # Явная инициализация коллекции — иначе после flush доступ
+        # к order.sub_orders вызовет lazy-load (в async это ошибка)
+        order.sub_orders = []
         await session.flush()
 
+        # Собираем подзаказы; коллекции items/shop инициализируем руками
+        created_subs: list[SubOrder] = []
         for shop_id, shop_matches in by_shop.items():
             sub = SubOrder(order_id=order.id, shop_id=shop_id, status=SubOrderStatus.PENDING.value)
+            sub.shop = shop_by_id[shop_id]
+            sub.items = []  # инициализация до flush — ключ к async-безопасности
             session.add(sub)
             await session.flush()
             subtotal = 0.0
@@ -248,12 +255,20 @@ class OrderService:
                     price=price,
                     status=ItemStatus.FOUND.value,
                 )
+                item.product = m.product
+                sub.items.append(item)  # append в инициализированную коллекцию
                 session.add(item)
                 subtotal += qty * price
             sub.subtotal_estimated = subtotal
+            created_subs.append(sub)
         await session.flush()
 
-        order.total_estimated = await self._recalc_total(session, order)
+        # Суммы по локальному списку
+        order.total_estimated = sum(
+            float(s.subtotal_estimated or 0) for s in created_subs
+        )
+        # Коллекция уже инициализирована — присваивание безопасно в async
+        order.sub_orders = created_subs
         await self._log_status(session, order, changed_by=client.telegram_id)
         await session.flush()
 
@@ -264,15 +279,15 @@ class OrderService:
             names = ", ".join(m.position.raw for m in not_found[:5])
             warn = f"\n⚠️ Не нашли: {names}. Уточните или уберите."
 
-        # 8. Оповещение продавцов
+        # 8. Оповещение продавцов (по локальному списку — без lazy-load)
         if is_preorder:
-            await self._notify_sellers_preorder(session, order)
+            await self._notify_sellers_preorder(session, order, subs=created_subs)
         else:
-            await self._notify_sellers_confirm(session, order)
+            await self._notify_sellers_confirm(session, order, subs=created_subs)
 
         # 9. Таймауты ответа продавцов (§11.1) — только для заказа «сейчас»
         if not is_preorder:
-            for sub in order.sub_orders:
+            for sub in created_subs:
                 self._scheduler.schedule_once(
                     job_id_seller_confirm(order.id, sub.shop_id),
                     self._settings.timeout_seller_confirm,
@@ -281,7 +296,7 @@ class OrderService:
                     sub.shop_id,
                 )
 
-        return order, self._format_preorder(order) + warn
+        return order, self._format_preorder(order, subs=created_subs) + warn
 
     # Таймаут-раннер подставляется извне, чтобы не плодить циклы
     _timeout_runner: object = None
@@ -341,11 +356,16 @@ class OrderService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _format_order_lines(order: Order) -> str:
-        """Список позиций заказа по магазинам."""
+    def _format_order_lines(order: Order, subs: Optional[list[SubOrder]] = None) -> str:
+        """Список позиций заказа по магазинам.
+
+        `subs` — явный список подзаказов; если не передан, берём order.sub_orders
+        (должен быть загружен через selectinload — в async lazy-load запрещён).
+        """
         lines: list[str] = []
         idx = 1
-        for sub in order.sub_orders:
+        source = subs if subs is not None else list(order.sub_orders)
+        for sub in source:
             shop_name = sub.shop.name if sub.shop else "?"
             if sub.status == SubOrderStatus.REJECTED.value:
                 continue
@@ -360,13 +380,16 @@ class OrderService:
                 idx += 1
         return "\n".join(lines)
 
-    def _format_preorder(self, order: Order) -> str:
+    def _format_preorder(
+        self, order: Order, subs: Optional[list[SubOrder]] = None
+    ) -> str:
         """Сводная таблица предзаказа для покупателя (§7.4)."""
         when = ""
         if order.scheduled_at:
             when = f" на {order.scheduled_at:%d.%m.%Y, %H:%M}"
         total = float(order.total_estimated or 0)
-        text = f"📋 Предзаказ{when}:\n{self._format_order_lines(order)}\n💰 Предварительно: {total:.0f} ₽"
+        lines = self._format_order_lines(order, subs=subs)
+        text = f"📋 Предзаказ{when}:\n{lines}\n💰 Предварительно: {total:.0f} ₽"
         if order.order_type == OrderType.PREORDER.value:
             text += (
                 "\n⚠️ Магазин подтвердит наличие за "
@@ -379,12 +402,12 @@ class OrderService:
     # ------------------------------------------------------------------
 
     async def _notify_sellers_confirm(
-        self, session: AsyncSession, order: Order
+        self, session: AsyncSession, order: Order, subs: Optional[list[SubOrder]] = None
     ) -> None:
         """Просьба подтвердить наличие (обычный заказ, §3.3 S5)."""
         from app.keyboards.seller_kb import sub_confirm_keyboard
 
-        for sub in order.sub_orders:
+        for sub in subs if subs is not None else []:
             if not sub.shop:
                 continue
             lines = [f"📩 Новый запрос от покупателя (заказ #{order.id}):"]
@@ -402,12 +425,12 @@ class OrderService:
             )
 
     async def _notify_sellers_preorder(
-        self, session: AsyncSession, order: Order
+        self, session: AsyncSession, order: Order, subs: Optional[list[SubOrder]] = None
     ) -> None:
         """Уведомление магазину о предзаказе (§7.5)."""
         from app.keyboards.seller_kb import preorder_seller_keyboard
 
-        for sub in order.sub_orders:
+        for sub in subs if subs is not None else []:
             if not sub.shop:
                 continue
             lines = [

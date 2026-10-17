@@ -75,7 +75,9 @@ class Shop(Base):
         DateTime(timezone=True), server_default=func.now()
     )
 
-    products: Mapped[list["Product"]] = relationship(back_populates="shop")
+    products: Mapped[list["Product"]] = relationship(
+        back_populates="shop", lazy="selectin"
+    )
 
     __table_args__ = (Index("idx_shops_geo", "address_geo", postgresql_using="gist"),)
 
@@ -99,7 +101,7 @@ class Product(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    shop: Mapped["Shop"] = relationship(back_populates="products")
+    shop: Mapped["Shop"] = relationship(back_populates="products", lazy="selectin")
 
     __table_args__ = (
         Index("idx_products_shop", "shop_id", "is_active"),
@@ -142,11 +144,14 @@ class Order(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
+    # selectin — чтобы в async не было lazy-load (MissingGreenlet)
     sub_orders: Mapped[list["SubOrder"]] = relationship(
-        back_populates="order", cascade="all, delete-orphan"
+        back_populates="order", cascade="all, delete-orphan", lazy="selectin"
     )
-    client: Mapped["User"] = relationship(foreign_keys=[client_id])
-    courier: Mapped[Optional["User"]] = relationship(foreign_keys=[courier_id])
+    client: Mapped["User"] = relationship(foreign_keys=[client_id], lazy="selectin")
+    courier: Mapped[Optional["User"]] = relationship(
+        foreign_keys=[courier_id], lazy="selectin"
+    )
 
     __table_args__ = (
         Index("idx_orders_client", "client_id", "created_at"),
@@ -176,10 +181,10 @@ class SubOrder(Base):
         DateTime(timezone=True), server_default=func.now()
     )
 
-    order: Mapped["Order"] = relationship(back_populates="sub_orders")
-    shop: Mapped["Shop"] = relationship()
+    order: Mapped["Order"] = relationship(back_populates="sub_orders", lazy="selectin")
+    shop: Mapped["Shop"] = relationship(lazy="selectin")
     items: Mapped[list["OrderItem"]] = relationship(
-        back_populates="sub_order", cascade="all, delete-orphan"
+        back_populates="sub_order", cascade="all, delete-orphan", lazy="selectin"
     )
 
     __table_args__ = (Index("idx_sub_orders_shop", "shop_id", "status"),)
@@ -208,8 +213,8 @@ class OrderItem(Base):
         DateTime(timezone=True), server_default=func.now()
     )
 
-    sub_order: Mapped["SubOrder"] = relationship(back_populates="items")
-    product: Mapped[Optional["Product"]] = relationship()
+    sub_order: Mapped["SubOrder"] = relationship(back_populates="items", lazy="selectin")
+    product: Mapped[Optional["Product"]] = relationship(lazy="selectin")
 
 
 class OrderStatusLog(Base):
