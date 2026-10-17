@@ -1,0 +1,1134 @@
+"""Сервис заказов — ядро бизнес-логики (§4, §10, §11 ТЗ).
+
+Полный цикл: парсинг списка → поиск магазинов → запросы продавцам →
+предзаказ покупателю → сборка → получение → постоплата → закрытие.
+
+Расширяемость: дополнительные события оформляются как новые методы сервиса
+и подписываются планировщиком/хендлерами; существующие не меняются.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.config import Settings
+from app.constants import (
+    DeliveryType,
+    ItemStatus,
+    OrderStatus,
+    OrderType,
+    PaymentMethod,
+    PaymentStatus,
+    PreorderEvent,
+    SubOrderStatus,
+)
+from app.db.models import (
+    Order,
+    OrderItem,
+    OrderStatusLog,
+    PreorderLog,
+    Product,
+    Shop,
+    SubOrder,
+    User,
+)
+from app.services.ban import BanService
+from app.services.geo import GeoPoint, GeoService
+from app.services.matcher import MatchResult, ProductMatcher
+from app.services.notifier import Notifier
+from app.services.parser import ParsedPosition, ProductParser
+from app.services.scheduler import (
+    SchedulerService,
+    job_id_assemble,
+    job_id_client_approve,
+    job_id_courier_deliver,
+    job_id_courier_pickup,
+    job_id_pickup,
+    job_id_seller_confirm,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def utcnow() -> datetime:
+    """Текущее время UTC."""
+    return datetime.now(timezone.utc)
+
+
+class OrderService:
+    """Фасад жизненного цикла заказа."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        parser: ProductParser,
+        matcher: ProductMatcher,
+        geo: GeoService,
+        notifier: Notifier,
+        ban: BanService,
+        scheduler: SchedulerService,
+    ) -> None:
+        self._settings = settings
+        self._parser = parser
+        self._matcher = matcher
+        self._geo = geo
+        self._notifier = notifier
+        self._ban = ban
+        self._scheduler = scheduler
+
+    # ------------------------------------------------------------------
+    # Загрузка сущностей
+    # ------------------------------------------------------------------
+
+    async def get_order(self, session: AsyncSession, order_id: int) -> Optional[Order]:
+        """Загружает заказ со всеми вложенными данными."""
+        stmt = (
+            select(Order)
+            .where(Order.id == order_id)
+            .options(
+                selectinload(Order.client),
+                selectinload(Order.sub_orders).selectinload(SubOrder.shop),
+                selectinload(Order.sub_orders)
+                .selectinload(SubOrder.items)
+                .selectinload(OrderItem.product),
+            )
+        )
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_sub_order(
+        self, session: AsyncSession, sub_order_id: int
+    ) -> Optional[SubOrder]:
+        """Загружает подзаказ с магазином, заказом и позициями."""
+        stmt = (
+            select(SubOrder)
+            .where(SubOrder.id == sub_order_id)
+            .options(
+                selectinload(SubOrder.shop),
+                selectinload(SubOrder.items).selectinload(OrderItem.product),
+                selectinload(SubOrder.order).selectinload(Order.client),
+            )
+        )
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_active_client_order(
+        self, session: AsyncSession, client_id: int
+    ) -> Optional[Order]:
+        """Последний «живой» заказ покупателя (для редактирования и статуса)."""
+        active_statuses = [
+            OrderStatus.DRAFT.value,
+            OrderStatus.PENDING_SELLERS.value,
+            OrderStatus.PENDING_CLIENT.value,
+            OrderStatus.ASSEMBLING.value,
+            OrderStatus.READY.value,
+            OrderStatus.DELIVERING.value,
+            OrderStatus.PREORDER_PENDING.value,
+            OrderStatus.PREORDER_REMINDED.value,
+            OrderStatus.PREORDER_CONFIRMED.value,
+            OrderStatus.PREORDER_SEARCHING.value,
+        ]
+        stmt = (
+            select(Order)
+            .where(Order.client_id == client_id)
+            .where(Order.status.in_(active_statuses))
+            .options(
+                selectinload(Order.client),
+                selectinload(Order.sub_orders).selectinload(SubOrder.shop),
+                selectinload(Order.sub_orders)
+                .selectinload(SubOrder.items)
+                .selectinload(OrderItem.product),
+            )
+            .order_by(Order.created_at.desc())
+            .limit(1)
+        )
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    # ------------------------------------------------------------------
+    # Создание заказа из текстового списка
+    # ------------------------------------------------------------------
+
+    async def create_from_text(
+        self,
+        session: AsyncSession,
+        client: User,
+        text: str,
+        scheduled_at: Optional[datetime] = None,
+        radius_m: Optional[int] = None,
+    ) -> tuple[Optional[Order], str]:
+        """Создаёт заказ (или предзаказ) из свободного текста.
+
+        Возвращает (заказ | None, сообщение для покупателя).
+        None + сообщение — ошибка, которую нужно показать как есть.
+        """
+        # 1. Парсинг списка (§8)
+        try:
+            positions = await self._parser.parse(text)
+        except ValueError as exc:
+            return None, f"⚠️ {exc}"
+
+        # 2. Точка клиента
+        if not client.address_geo:
+            return None, "⚠️ Сначала укажите адрес доставки (/start → профиль)."
+        client_point = self._point_from_wkt(client.address_geo)
+
+        # 3. Магазины в радиусе (§3.1 G4)
+        shops = await self._geo.find_nearby_shops(
+            session, client_point, radius_m=radius_m
+        )
+        if not shops:
+            return None, (
+                "😔 Рядом не нашлось активных магазинов в радиусе "
+                f"{radius_m or self._settings.default_search_radius_m} м.\n"
+                "Попробуйте позже или расширьте радиус."
+            )
+
+        # 4. Витрина магазинов
+        products = await self._load_products(session, [s.id for s in shops])
+        shop_by_id = {s.id: s for s in shops}
+        catalog = [(p, shop_by_id[p.shop_id]) for p in products]
+
+        # 5. Fuzzy-матчинг позиций (§8.3)
+        matches = self._matcher.match(positions, catalog)
+        found = [m for m in matches if m.product is not None]
+        if not found:
+            return None, (
+                "😕 Ни одна позиция не найдена на витринах рядом с вами.\n"
+                "Проверьте названия или попробуйте другой список."
+            )
+
+        # 6. Группировка по магазинам → подзаказы
+        by_shop: dict[int, list[MatchResult]] = {}
+        for m in found:
+            assert m.shop is not None
+            by_shop.setdefault(m.shop.id, []).append(m)
+
+        # 7. Создание заказа и подзаказов
+        is_preorder = scheduled_at is not None
+        order = Order(
+            client_id=client.id,
+            status=(
+                OrderStatus.PREORDER_PENDING.value
+                if is_preorder
+                else OrderStatus.PENDING_SELLERS.value
+            ),
+            order_type=(
+                OrderType.PREORDER.value if is_preorder else OrderType.NOW.value
+            ),
+            scheduled_at=scheduled_at,
+            delivery_geo=client.address_geo,
+            delivery_address=client.address_text,
+            payment_status=PaymentStatus.PENDING.value,
+        )
+        session.add(order)
+        await session.flush()
+
+        for shop_id, shop_matches in by_shop.items():
+            sub = SubOrder(order_id=order.id, shop_id=shop_id, status=SubOrderStatus.PENDING.value)
+            session.add(sub)
+            await session.flush()
+            subtotal = 0.0
+            for m in shop_matches:
+                assert m.product is not None
+                qty = m.position.qty if m.position.qty else 1.0
+                price = float(m.product.price)
+                item = OrderItem(
+                    sub_order_id=sub.id,
+                    product_id=m.product.id,
+                    raw_name=m.position.normalized or m.position.raw,
+                    qty=qty,
+                    unit=m.position.unit or m.product.unit,
+                    price=price,
+                    status=ItemStatus.FOUND.value,
+                )
+                session.add(item)
+                subtotal += qty * price
+            sub.subtotal_estimated = subtotal
+        await session.flush()
+
+        order.total_estimated = await self._recalc_total(session, order)
+        await self._log_status(session, order, changed_by=client.telegram_id)
+        await session.flush()
+
+        # Неопознанные позиции — предупреждаем
+        not_found = [m for m in matches if m.product is None]
+        warn = ""
+        if not_found:
+            names = ", ".join(m.position.raw for m in not_found[:5])
+            warn = f"\n⚠️ Не нашли: {names}. Уточните или уберите."
+
+        # 8. Оповещение продавцов
+        if is_preorder:
+            await self._notify_sellers_preorder(session, order)
+        else:
+            await self._notify_sellers_confirm(session, order)
+
+        # 9. Таймауты ответа продавцов (§11.1) — только для заказа «сейчас»
+        if not is_preorder:
+            for sub in order.sub_orders:
+                self._scheduler.schedule_once(
+                    job_id_seller_confirm(order.id, sub.shop_id),
+                    self._settings.timeout_seller_confirm,
+                    self._timeout_runner.on_seller_confirm_timeout,  # type: ignore[attr-defined]
+                    order.id,
+                    sub.shop_id,
+                )
+
+        return order, self._format_preorder(order) + warn
+
+    # Таймаут-раннер подставляется извне, чтобы не плодить циклы
+    _timeout_runner: object = None
+
+    def set_timeout_runner(self, runner: object) -> None:
+        """Привязывает исполнитель таймаутов (вызывается при сборке приложения)."""
+        self._timeout_runner = runner
+
+    async def _load_products(
+        self, session: AsyncSession, shop_ids: list[int]
+    ) -> list[Product]:
+        """Активные товары указанных магазинов."""
+        if not shop_ids:
+            return []
+        result = await session.execute(
+            select(Product)
+            .where(Product.shop_id.in_(shop_ids))
+            .where(Product.is_active.is_(True))
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    def _point_from_wkt(wkt: str) -> GeoPoint:
+        """POINT(lon lat) → GeoPoint."""
+        inner = wkt[wkt.find("(") + 1 : wkt.find(")")]
+        lon_s, lat_s = inner.split()
+        return GeoPoint(lat=float(lat_s), lon=float(lon_s))
+
+    async def _recalc_total(self, session: AsyncSession, order: Order) -> float:
+        """Пересчёт предварительной суммы по подзаказам."""
+        total = 0.0
+        for sub in order.sub_orders:
+            if sub.status == SubOrderStatus.REJECTED.value:
+                continue
+            total += float(sub.subtotal_estimated or 0)
+        delivery = (
+            float(order.delivery_cost or 0)
+            if order.delivery_type == DeliveryType.COURIER.value
+            else 0.0
+        )
+        return total + delivery
+
+    async def _log_status(
+        self,
+        session: AsyncSession,
+        order: Order,
+        changed_by: Optional[int] = None,
+    ) -> None:
+        """Пишет переход статуса в order_status_log."""
+        session.add(
+            OrderStatusLog(order_id=order.id, status=order.status, changed_by=changed_by)
+        )
+        await session.flush()
+
+    # ------------------------------------------------------------------
+    # Форматирование сообщений
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_order_lines(order: Order) -> str:
+        """Список позиций заказа по магазинам."""
+        lines: list[str] = []
+        idx = 1
+        for sub in order.sub_orders:
+            shop_name = sub.shop.name if sub.shop else "?"
+            if sub.status == SubOrderStatus.REJECTED.value:
+                continue
+            for item in sub.items:
+                unit = item.unit or ""
+                qty = item.qty or 0
+                price = item.price or 0
+                lines.append(
+                    f"{idx}. {item.raw_name} — {qty:g} {unit} — ~{qty * price:.0f} ₽"
+                    f" ({shop_name})"
+                )
+                idx += 1
+        return "\n".join(lines)
+
+    def _format_preorder(self, order: Order) -> str:
+        """Сводная таблица предзаказа для покупателя (§7.4)."""
+        when = ""
+        if order.scheduled_at:
+            when = f" на {order.scheduled_at:%d.%m.%Y, %H:%M}"
+        total = float(order.total_estimated or 0)
+        text = f"📋 Предзаказ{when}:\n{self._format_order_lines(order)}\n💰 Предварительно: {total:.0f} ₽"
+        if order.order_type == OrderType.PREORDER.value:
+            text += (
+                "\n⚠️ Магазин подтвердит наличие за "
+                f"{self._settings.preorder_reminder_hours} часов до даты."
+            )
+        return text
+
+    # ------------------------------------------------------------------
+    # Оповещения продавцов
+    # ------------------------------------------------------------------
+
+    async def _notify_sellers_confirm(
+        self, session: AsyncSession, order: Order
+    ) -> None:
+        """Просьба подтвердить наличие (обычный заказ, §3.3 S5)."""
+        from app.keyboards.seller_kb import sub_confirm_keyboard
+
+        for sub in order.sub_orders:
+            if not sub.shop:
+                continue
+            lines = [f"📩 Новый запрос от покупателя (заказ #{order.id}):"]
+            for item in sub.items:
+                unit = item.unit or ""
+                lines.append(f"• {item.raw_name} — {item.qty or 0:g} {unit}")
+            lines.append(f"💰 ~{sub.subtotal_estimated or 0:.0f} ₽")
+            lines.append("Подтвердите наличие за "
+                         f"{self._settings.timeout_seller_confirm // 60} мин.")
+            await self._notifier.notify_shop(
+                session,
+                sub.shop,
+                "\n".join(lines),
+                keyboard=sub_confirm_keyboard(sub.id),
+            )
+
+    async def _notify_sellers_preorder(
+        self, session: AsyncSession, order: Order
+    ) -> None:
+        """Уведомление магазину о предзаказе (§7.5)."""
+        from app.keyboards.seller_kb import preorder_seller_keyboard
+
+        for sub in order.sub_orders:
+            if not sub.shop:
+                continue
+            lines = [
+                f"📅 Новый предзаказ на {order.scheduled_at:%d.%m.%Y, %H:%M}"
+                if order.scheduled_at
+                else "📅 Новый предзаказ",
+            ]
+            for item in sub.items:
+                unit = item.unit or ""
+                lines.append(f"• {item.raw_name} — {item.qty or 0:g} {unit}")
+            lines.append(f"💰 Предварительно: {sub.subtotal_estimated or 0:.0f} ₽")
+            await self._notifier.notify_shop(
+                session,
+                sub.shop,
+                "\n".join(lines),
+                keyboard=preorder_seller_keyboard(sub.id),
+            )
+
+    # ------------------------------------------------------------------
+    # Ответ продавца (подтвердил / отклонил)
+    # ------------------------------------------------------------------
+
+    async def seller_respond(
+        self,
+        session: AsyncSession,
+        sub_order: SubOrder,
+        accept: bool,
+        reason: str = "",
+        changed_by: Optional[int] = None,
+    ) -> None:
+        """Продавец подтверждает или отклоняет свой подзаказ (S6)."""
+        order = await self.get_order(session, sub_order.order_id)
+        if order is None or order.status not in (
+            OrderStatus.PENDING_SELLERS.value,
+            OrderStatus.PREORDER_PENDING.value,
+            OrderStatus.PREORDER_SEARCHING.value,
+        ):
+            return
+
+        # Отменяем таймер ответа этого магазина
+        self._scheduler.cancel(job_id_seller_confirm(order.id, sub_order.shop_id))
+
+        if accept:
+            sub_order.status = SubOrderStatus.CONFIRMED.value
+        else:
+            sub_order.status = SubOrderStatus.REJECTED.value
+            for item in sub_order.items:
+                item.status = ItemStatus.NOT_FOUND.value
+                if reason:
+                    item.note = reason
+        await session.flush()
+
+        if order.order_type == OrderType.PREORDER.value:
+            from app.services.preorder import PreorderService  # локальный импорт
+
+            # Логирование события предзаказа делает PreorderService;
+            # здесь фиксируем факт ответа
+            session.add(
+                PreorderLog(
+                    order_id=order.id,
+                    event=(
+                        PreorderEvent.SELLER_CONFIRMED.value
+                        if accept
+                        else PreorderEvent.SELLER_REJECTED.value
+                    ),
+                    shop_id=sub_order.shop_id,
+                )
+            )
+            await session.flush()
+            # Для предзаказа ответ продавца сразу подтверждает состав
+            await self._try_finalize_sellers(session, order)
+            return
+
+        await self._try_finalize_sellers(session, order)
+
+    async def _try_finalize_sellers(self, session: AsyncSession, order: Order) -> None:
+        """Когда все магазины ответили — собираем предзаказ для покупателя."""
+        statuses = {s.status for s in order.sub_orders}
+        unresolved = {
+            SubOrderStatus.PENDING.value,
+            SubOrderStatus.ASSEMBLING.value,
+            SubOrderStatus.READY.value,
+        }
+        if statuses & unresolved:
+            return  # ещё ждём кого-то
+
+        # Убираем отклонённые подзаказы из расчёта
+        active_subs = [
+            s
+            for s in order.sub_orders
+            if s.status != SubOrderStatus.REJECTED.value
+        ]
+        if not active_subs:
+            order.status = OrderStatus.CANCELLED.value
+            await self._log_status(session, order)
+            await self._notifier.send(
+                session,
+                order.client.telegram_id,
+                "😔 Ни один магазин не смог подтвердить наличие по вашему списку.",
+            )
+            return
+
+        # Пересчитываем итог только по подтверждённым
+        order.total_estimated = sum(
+            float(s.subtotal_estimated or 0) for s in active_subs
+        )
+        order.status = OrderStatus.PENDING_CLIENT.value
+        await self._log_status(session, order)
+        await session.flush()
+
+        from app.keyboards.client_kb import approve_preorder_keyboard
+
+        rejected_names = [
+            s.shop.name
+            for s in order.sub_orders
+            if s.status == SubOrderStatus.REJECTED.value and s.shop
+        ]
+        warn = ""
+        if rejected_names:
+            warn = "\n⚠️ Отклонены: " + ", ".join(rejected_names)
+
+        text = (
+            self._format_preorder(order)
+            + warn
+            + "\n\nПодтвердите заказ в течение "
+            f"{self._settings.timeout_client_approve // 60} мин."
+        )
+        await self._notifier.send(
+            session,
+            order.client.telegram_id,
+            text,
+            keyboard=approve_preorder_keyboard(order.id),
+        )
+        # Таймер утверждения покупателем (§11.1)
+        self._scheduler.schedule_once(
+            job_id_client_approve(order.id),
+            self._settings.timeout_client_approve,
+            self._timeout_runner.on_client_approve_timeout,  # type: ignore[attr-defined]
+            order.id,
+        )
+
+    # ------------------------------------------------------------------
+    # Утверждение покупателем
+    # ------------------------------------------------------------------
+
+    async def client_approve(
+        self,
+        session: AsyncSession,
+        order: Order,
+        delivery_type: str,
+        payment_method: str,
+        changed_by: Optional[int] = None,
+    ) -> None:
+        """Покупатель утвердил заказ и выбрал способ получения/оплаты (C8–C10)."""
+        if order.status != OrderStatus.PENDING_CLIENT.value:
+            return
+        self._scheduler.cancel(job_id_client_approve(order.id))
+
+        order.delivery_type = delivery_type
+        order.payment_method = payment_method
+        if delivery_type == DeliveryType.COURIER.value:
+            order.delivery_cost = float(self._settings.delivery_cost)
+            order.total_estimated = float(order.total_estimated or 0) + float(
+                order.delivery_cost
+            )
+
+        order.status = OrderStatus.ASSEMBLING.value
+        await self._log_status(session, order, changed_by=changed_by)
+        await session.flush()
+
+        # Сообщаем магазинам: собирайте
+        from app.keyboards.seller_kb import sub_assembled_keyboard
+
+        for sub in order.sub_orders:
+            if sub.status != SubOrderStatus.CONFIRMED.value:
+                continue
+            sub.status = SubOrderStatus.ASSEMBLING.value
+            if sub.shop:
+                lines = [f"🛒 Собирайте заказ #{order.id}:"]
+                for item in sub.items:
+                    unit = item.unit or ""
+                    lines.append(f"• {item.raw_name} — {item.qty or 0:g} {unit}")
+                lines.append(
+                    "Отметьте, когда соберёте. Если вес отличается — укажите факт."
+                )
+                await self._notifier.notify_shop(
+                    session,
+                    sub.shop,
+                    "\n".join(lines),
+                    keyboard=sub_assembled_keyboard(sub.id),
+                )
+            self._scheduler.schedule_once(
+                job_id_assemble(order.id, sub.id),
+                self._settings.timeout_seller_assemble,
+                self._timeout_runner.on_assemble_timeout,  # type: ignore[attr-defined]
+                order.id,
+                sub.id,
+            )
+        await session.flush()
+
+        delivery_note = (
+            f"🛵 Доставка {order.delivery_cost} ₽. "
+            if delivery_type == DeliveryType.COURIER.value
+            else "🚶 Самовывоз. "
+        )
+        await self._notifier.send(
+            session,
+            order.client.telegram_id,
+            f"✅ Заказ #{order.id} принят!\n{delivery_note}"
+            f"💰 Итого ~{float(order.total_estimated or 0):.0f} ₽ (постоплата при получении).\n"
+            "Магазины собирают — сообщу, когда будет готово.",
+        )
+
+    # ------------------------------------------------------------------
+    # Сборка
+    # ------------------------------------------------------------------
+
+    async def mark_assembled(
+        self,
+        session: AsyncSession,
+        sub_order: SubOrder,
+        actual_items: Optional[dict[int, tuple[float, float]]] = None,
+        changed_by: Optional[int] = None,
+    ) -> None:
+        """Продавец отметил «Собрал» (S8).
+
+        `actual_items` — {item_id: (qty, price)} фактические значения (опционально).
+        """
+        if sub_order.status not in (
+            SubOrderStatus.ASSEMBLING.value,
+            SubOrderStatus.CONFIRMED.value,
+        ):
+            return
+        self._scheduler.cancel(job_id_assemble(sub_order.order_id, sub_order.id))
+
+        subtotal = 0.0
+        for item in sub_order.items:
+            if actual_items and item.id in actual_items:
+                qty, price = actual_items[item.id]
+                item.actual_qty = qty
+                item.actual_price = price
+            else:
+                item.actual_qty = item.qty
+                item.actual_price = item.price
+            subtotal += float(item.actual_qty or 0) * float(item.actual_price or 0)
+        sub_order.subtotal_actual = subtotal
+        sub_order.status = SubOrderStatus.READY.value
+        sub_order.assembled_at = utcnow()
+        await session.flush()
+
+        order = await self.get_order(session, sub_order.order_id)
+        if order is None:
+            return
+        # Все подзаказы готовы?
+        if any(
+            s.status
+            in (SubOrderStatus.ASSEMBLING.value, SubOrderStatus.CONFIRMED.value)
+            for s in order.sub_orders
+        ):
+            return
+
+        order.status = OrderStatus.READY.value
+        order.assembled_at = utcnow()
+        order.total_actual = sum(
+            float(s.subtotal_actual or 0)
+            for s in order.sub_orders
+            if s.status == SubOrderStatus.READY.value
+        ) + float(order.delivery_cost or 0)
+        await self._log_status(session, order, changed_by=changed_by)
+        await session.flush()
+
+        from app.keyboards.client_kb import ready_keyboard
+
+        # Адреса магазинов для самовывоза / инструкция для доставки
+        lines = [f"✅ Заказ #{order.id} собран!", f"💰 Итого: {float(order.total_actual or 0):.0f} ₽"]
+        if order.delivery_type == DeliveryType.PICKUP.value or order.delivery_type is None:
+            lines.append("📍 Заберите:")
+            for s in order.sub_orders:
+                if s.status == SubOrderStatus.READY.value and s.shop:
+                    lines.append(f"• «{s.shop.name}», {s.shop.address_text or 'адрес уточните'}")
+            lines.append(
+                f"⏰ Заберите в течение {self._settings.timeout_client_pickup // 60} минут."
+            )
+        else:
+            lines.append("🛵 Курьер заберёт и доставит вам.")
+            # Назначаем курьера
+            from app.services.delivery import DeliveryService
+
+            # delivery сервис доступен через реестр? используем локально
+            pass
+
+        await self._notifier.send(
+            session,
+            order.client.telegram_id,
+            "\n".join(lines),
+            keyboard=ready_keyboard(order.id),
+        )
+        # Таймер получения/оплаты
+        self._scheduler.schedule_once(
+            job_id_pickup(order.id),
+            self._settings.timeout_client_pickup,
+            self._timeout_runner.on_pickup_timeout,  # type: ignore[attr-defined]
+            order.id,
+        )
+
+        # Для доставки: пробуем назначить курьера сразу
+        if order.delivery_type == DeliveryType.COURIER.value:
+            await self._try_assign_courier(session, order)
+
+    async def _try_assign_courier(self, session: AsyncSession, order: Order) -> None:
+        """Пытается назначить курьера; если нет — пишет админам."""
+        from app.services.delivery import DeliveryService
+
+        # Инстанс доставки придёт из реестра через референс
+        delivery: DeliveryService = self._delivery  # type: ignore[attr-defined]
+        courier = await delivery.assign_courier(session, order)
+        if courier is None:
+            settings_admins = self._settings.admin_ids
+            await self._notifier.notify_admins(
+                session,
+                settings_admins,
+                f"⚠️ Заказ #{order.id}: нужен курьер, свободных нет. "
+                "Назначьте вручную или возьмите как продавец.",
+            )
+            return
+
+        order.status = OrderStatus.DELIVERING.value
+        await self._log_status(session, order)
+        await session.flush()
+
+        from app.keyboards.courier_kb import courier_order_keyboard
+
+        lines = [
+            f"🛵 Новая доставка (заказ #{order.id}):",
+        ]
+        for s in order.sub_orders:
+            if s.status == SubOrderStatus.READY.value and s.shop:
+                lines.append(f"🏪 Забрать: «{s.shop.name}», {s.shop.address_text}")
+        lines.append(
+            f"🏠 Доставить: {order.delivery_address or 'адрес клиента в профиле'}"
+        )
+        lines.append(f"💰 К оплате курьером не принимается — постоплата покупателю.")
+        await self._notifier.send(
+            session,
+            courier.telegram_id,
+            "\n".join(lines),
+            keyboard=courier_order_keyboard(order.id),
+        )
+        self._scheduler.schedule_once(
+            job_id_courier_pickup(order.id),
+            self._settings.timeout_courier_pickup,
+            self._timeout_runner.on_courier_pickup_timeout,  # type: ignore[attr-defined]
+            order.id,
+        )
+
+    def bind_delivery(self, delivery_service: object) -> None:
+        """Привязывает DeliveryService (избегаем циклического импорта)."""
+        self._delivery = delivery_service
+
+    # ------------------------------------------------------------------
+    # Курьер
+    # ------------------------------------------------------------------
+
+    async def courier_picked_up(
+        self, session: AsyncSession, order: Order, changed_by: Optional[int] = None
+    ) -> None:
+        """Курьер забрал заказ у магазина(ов) (K3)."""
+        if order.status != OrderStatus.DELIVERING.value:
+            return
+        self._scheduler.cancel(job_id_courier_pickup(order.id))
+        for sub in order.sub_orders:
+            if sub.status == SubOrderStatus.READY.value:
+                sub.status = SubOrderStatus.PICKED_UP.value
+                sub.picked_up_at = utcnow()
+        order.picked_up_at = utcnow()
+        await self._log_status(session, order, changed_by=changed_by)
+        await session.flush()
+
+        await self._notifier.send(
+            session,
+            order.client.telegram_id,
+            f"🛵 Курьер забрал ваш заказ #{order.id} и несёт к вам!",
+        )
+        self._scheduler.schedule_once(
+            job_id_courier_deliver(order.id),
+            self._settings.timeout_courier_deliver,
+            self._timeout_runner.on_courier_deliver_timeout,  # type: ignore[attr-defined]
+            order.id,
+        )
+
+    async def courier_delivered(
+        self, session: AsyncSession, order: Order, changed_by: Optional[int] = None
+    ) -> None:
+        """Курьер доставил заказ (K4)."""
+        if order.status != OrderStatus.DELIVERING.value:
+            return
+        self._scheduler.cancel(job_id_courier_deliver(order.id))
+        order.status = OrderStatus.READY.value
+        await self._log_status(session, order, changed_by=changed_by)
+        await session.flush()
+
+        from app.keyboards.client_kb import ready_keyboard
+
+        await self._notifier.send(
+            session,
+            order.client.telegram_id,
+            f"🏠 Заказ #{order.id} доставлен!\n"
+            f"💰 К оплате: {float(order.total_actual or 0):.0f} ₽ (постоплата).",
+            keyboard=ready_keyboard(order.id),
+        )
+        self._scheduler.schedule_once(
+            job_id_pickup(order.id),
+            self._settings.timeout_client_payment,
+            self._timeout_runner.on_pickup_timeout,  # type: ignore[attr-defined]
+            order.id,
+        )
+
+    # ------------------------------------------------------------------
+    # Оплата (постоплата, §5)
+    # ------------------------------------------------------------------
+
+    async def client_says_paid(
+        self, session: AsyncSession, order: Order, changed_by: Optional[int] = None
+    ) -> None:
+        """Покупатель нажал «Оплатил» — ждём подтверждения продавца."""
+        if order.status != OrderStatus.READY.value:
+            return
+        # Сообщаем продавцам
+        for sub in order.sub_orders:
+            if sub.status != SubOrderStatus.READY.value or not sub.shop:
+                continue
+            from app.keyboards.seller_kb import payment_confirm_keyboard
+
+            await self._notifier.notify_shop(
+                session,
+                sub.shop,
+                f"💵 Покупатель сообщил об оплате заказа #{order.id} "
+                f"({order.payment_method}). Подтвердите получение.",
+                keyboard=payment_confirm_keyboard(order.id, sub.id),
+            )
+        await self._notifier.send(
+            session,
+            order.client.telegram_id,
+            "👍 Отлично! Передал продавцу — он подтвердит получение оплаты.",
+        )
+
+    async def seller_confirmed_payment(
+        self, session: AsyncSession, order: Order, changed_by: Optional[int] = None
+    ) -> None:
+        """Продавец нажал «Получил оплату» — заказ закрыт (S8)."""
+        if order.status not in (OrderStatus.READY.value, OrderStatus.PAID.value):
+            return
+        self._scheduler.cancel(job_id_pickup(order.id))
+        for sub in order.sub_orders:
+            if sub.status == SubOrderStatus.READY.value:
+                sub.status = SubOrderStatus.DONE.value
+        order.payment_status = PaymentStatus.PAID.value
+        order.paid_at = utcnow()
+        order.status = OrderStatus.DONE.value
+        await self._log_status(session, order, changed_by=changed_by)
+        await session.flush()
+        await self._notifier.send(
+            session,
+            order.client.telegram_id,
+            f"✅ Заказ #{order.id} оплачен и закрыт. Спасибо за покупку!",
+        )
+
+    async def seller_got_cash(
+        self, session: AsyncSession, order: Order, sub_order: SubOrder, changed_by: Optional[int] = None
+    ) -> None:
+        """Продавец подтвердил выдачу/получение денег при самовывозе."""
+        sub_order.status = SubOrderStatus.PICKED_UP.value
+        sub_order.picked_up_at = utcnow()
+        await session.flush()
+        # Если все подзаказы выданы — закрываем
+        order = await self.get_order(session, order.id)
+        if order is None:
+            return
+        if all(
+            s.status in (SubOrderStatus.PICKED_UP.value, SubOrderStatus.DONE.value)
+            for s in order.sub_orders
+        ):
+            await self.seller_confirmed_payment(session, order, changed_by=changed_by)
+
+    # ------------------------------------------------------------------
+    # Отмена и неявка
+    # ------------------------------------------------------------------
+
+    async def client_cancel(
+        self,
+        session: AsyncSession,
+        order: Order,
+        reason: str = "",
+        changed_by: Optional[int] = None,
+    ) -> None:
+        """Отмена покупателем до сборки (C13) — без штрафа."""
+        cancellable = {
+            OrderStatus.DRAFT.value,
+            OrderStatus.PENDING_SELLERS.value,
+            OrderStatus.PENDING_CLIENT.value,
+            OrderStatus.PREORDER_PENDING.value,
+            OrderStatus.PREORDER_REMINDED.value,
+            OrderStatus.PREORDER_SEARCHING.value,
+        }
+        if order.status not in cancellable:
+            return
+        self._scheduler.cancel_prefix(f"order:{order.id}:")
+        order.status = (
+            OrderStatus.PREORDER_CANCELLED.value
+            if order.order_type == OrderType.PREORDER.value
+            else OrderStatus.CANCELLED.value
+        )
+        for sub in order.sub_orders:
+            sub.status = SubOrderStatus.CANCELLED.value
+        await self._log_status(session, order, changed_by=changed_by)
+        await session.flush()
+        # Уведомляем магазины
+        for sub in order.sub_orders:
+            if sub.shop:
+                await self._notifier.notify_shop(
+                    session,
+                    sub.shop,
+                    f"❌ Покупатель отменил заказ #{order.id}.",
+                )
+        await self._notifier.send(
+            session,
+            order.client.telegram_id,
+            f"❌ Заказ #{order.id} отменён."
+            + (f"\nПричина: {reason}" if reason else ""),
+        )
+        if order.order_type == OrderType.PREORDER.value:
+            session.add(
+                PreorderLog(order_id=order.id, event=PreorderEvent.CANCELLED.value)
+            )
+            await session.flush()
+
+    async def register_no_show(
+        self, session: AsyncSession, order: Order, reason: str
+    ) -> None:
+        """Фиксирует неявку/неоплату и применяет бан-логику (§5.4)."""
+        order.status = OrderStatus.NO_SHOW.value
+        await self._log_status(session, order)
+        await session.flush()
+        client = await session.get(User, order.client_id)
+        if client is not None:
+            await self._ban.register_violation(
+                session, client, reason=reason, order_id=order.id
+            )
+
+    # ------------------------------------------------------------------
+    # Таймауты (вызываются TimeoutRunner)
+    # ------------------------------------------------------------------
+
+    async def handle_seller_confirm_timeout(
+        self, session: AsyncSession, order_id: int, shop_id: int
+    ) -> None:
+        """Магазин не ответил за отведённое время — исключаем его (§11.1)."""
+        order = await self.get_order(session, order_id)
+        if order is None or order.status != OrderStatus.PENDING_SELLERS.value:
+            return
+        sub = next(
+            (s for s in order.sub_orders if s.shop_id == shop_id), None
+        )
+        if sub is None or sub.status != SubOrderStatus.PENDING.value:
+            return
+        sub.status = SubOrderStatus.REJECTED.value
+        await session.flush()
+        logger.info("Магазин %s исключён из заказа %s (таймаут)", shop_id, order_id)
+        await self._try_finalize_sellers(session, order)
+
+    async def handle_client_approve_timeout(
+        self, session: AsyncSession, order_id: int
+    ) -> None:
+        """Покупатель не утвердил предзаказ — отмена (§11.1)."""
+        order = await self.get_order(session, order_id)
+        if order is None or order.status != OrderStatus.PENDING_CLIENT.value:
+            return
+        order.status = OrderStatus.CANCELLED.value
+        for sub in order.sub_orders:
+            sub.status = SubOrderStatus.CANCELLED.value
+        await self._log_status(session, order)
+        await session.flush()
+        await self._notifier.send(
+            session,
+            order.client.telegram_id,
+            f"❌ Предзаказ #{order.id} отменён: не получено подтверждение вовремя.",
+        )
+
+    async def handle_assemble_timeout(
+        self, session: AsyncSession, order_id: int, sub_order_id: int
+    ) -> None:
+        """Магазин не собрал — напоминание, затем отмена (§11.1)."""
+        order = await self.get_order(session, order_id)
+        if order is None:
+            return
+        sub = next((s for s in order.sub_orders if s.id == sub_order_id), None)
+        if sub is None or sub.status != SubOrderStatus.ASSEMBLING.value:
+            return
+        # Первый таймаут — напоминание; повторный (когда job пересоздан) — отмена
+        if not getattr(sub, "_assemble_reminded", False):
+            # Используем note как маркер напоминания
+            reminded = any(
+                (i.note or "").startswith("напоминание") for i in sub.items
+            )
+            if not reminded:
+                for item in sub.items:
+                    item.note = "напоминание о сборке"
+                if sub.shop:
+                    from app.keyboards.seller_kb import sub_assembled_keyboard as _kb
+
+                    await self._notifier.notify_shop(
+                        session,
+                        sub.shop,
+                        f"⏰ Напоминание: заказ #{order.id} всё ещё ждёт сборки!",
+                        keyboard=_kb(sub.id),
+                    )
+                self._scheduler.schedule_once(
+                    job_id_assemble(order.id, sub.id),
+                    self._settings.timeout_seller_assemble,
+                    self._timeout_runner.on_assemble_timeout,  # type: ignore[attr-defined]
+                    order.id,
+                    sub.id,
+                )
+                return
+        # Второй раз — отменяем подзаказ
+        sub.status = SubOrderStatus.REJECTED.value
+        await session.flush()
+        # Если это был единственный — отменяем заказ
+        if all(
+            s.status in (SubOrderStatus.REJECTED.value, SubOrderStatus.CANCELLED.value)
+            for s in order.sub_orders
+        ):
+            order.status = OrderStatus.CANCELLED.value
+            await self._log_status(session, order)
+            await self._notifier.send(
+                session,
+                order.client.telegram_id,
+                f"❌ Заказ #{order.id} отменён: магазины не собрали вовремя.",
+            )
+        else:
+            await self._notifier.send(
+                session,
+                order.client.telegram_id,
+                f"⚠️ Магазин не собрал свою часть заказа #{order.id} вовремя. "
+                "Остальные позиции продолжаем готовить.",
+            )
+
+    async def handle_pickup_timeout(
+        self, session: AsyncSession, order_id: int
+    ) -> None:
+        """Покупатель не забрал/не оплатил — бан-логика (§5.4)."""
+        order = await self.get_order(session, order_id)
+        if order is None or order.status not in (
+            OrderStatus.READY.value,
+            OrderStatus.PAID.value,
+        ):
+            return
+        await self.register_no_show(
+            session,
+            order,
+            reason="Не забрал/не оплатил заказ вовремя",
+        )
+        for sub in order.sub_orders:
+            if sub.shop:
+                await self._notifier.notify_shop(
+                    session,
+                    sub.shop,
+                    f"😔 Покупатель не забрал заказ #{order.id} вовремя. "
+                    "Позиции можно вернуть на витрину.",
+                )
+
+    async def handle_courier_pickup_timeout(
+        self, session: AsyncSession, order_id: int
+    ) -> None:
+        """Курьер не забрал заказ — напоминание админам."""
+        order = await self.get_order(session, order_id)
+        if order is None or order.status != OrderStatus.DELIVERING.value:
+            return
+        await self._notifier.notify_admins(
+            session,
+            self._settings.admin_ids,
+            f"⚠️ Заказ #{order.id}: курьер не забрал вовремя. Проверьте доставку.",
+        )
+
+    async def handle_courier_deliver_timeout(
+        self, session: AsyncSession, order_id: int
+    ) -> None:
+        """Курьер не доставил — напоминание."""
+        order = await self.get_order(session, order_id)
+        if order is None or order.status != OrderStatus.DELIVERING.value:
+            return
+        await self._notifier.notify_admins(
+            session,
+            self._settings.admin_ids,
+            f"⚠️ Заказ #{order.id}: курьер не доставил вовремя.",
+        )
+        # Напоминаем самому курьеру
+        if order.courier_id:
+            courier = await session.get(User, order.courier_id)
+            if courier:
+                await self._notifier.send(
+                    session,
+                    courier.telegram_id,
+                    f"⏰ Заказ #{order.id}: доставка задерживается. Отметьте доставку.",
+                )
+
+    # ------------------------------------------------------------------
+    # Повтор заказа (C12)
+    # ------------------------------------------------------------------
+
+    async def repeat_order(
+        self, session: AsyncSession, client: User, source_order: Order
+    ) -> tuple[Optional[Order], str]:
+        """Формирует новый заказ по позициям прошлого (кнопка «Повторить»)."""
+        lines: list[str] = []
+        for sub in source_order.sub_orders:
+            for item in sub.items:
+                unit = item.unit or ""
+                qty = item.qty or 0
+                lines.append(f"{item.raw_name} {qty:g} {unit}")
+        if not lines:
+            return None, "В старом заказе нечего повторять."
+        text = ", ".join(lines)
+        return await self.create_from_text(session, client, text)

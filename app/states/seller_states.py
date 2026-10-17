@@ -1,0 +1,22 @@
+"""FSM-состояния продавца."""
+
+from aiogram.fsm.state import State, StatesGroup
+
+
+class SellerReg(StatesGroup):
+    """Регистрация магазина (S1)."""
+
+    name = State()
+    address = State()
+    phone = State()
+    payment_details = State()
+
+
+class SellerProduct(StatesGroup):
+    """Создание карточки товара (S2)."""
+
+    name = State()
+    price = State()
+    unit = State()
+    description = State()
+    photo = State()

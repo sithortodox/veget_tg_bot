@@ -1,0 +1,15 @@
+# Основной стек из ТЗ
+aiogram>=3.13,<4
+asyncpg>=0.29
+sqlalchemy[asyncio]>=2.0.30
+geoalchemy2>=0.15
+redis>=5.0
+openai>=1.40
+rapidfuzz>=3.9
+aiohttp>=3.9
+apscheduler>=3.10,<4
+pandas>=2.2
+openpyxl>=3.1
+pydantic>=2.7
+pydantic-settings>=2.3
+python-dotenv>=1.0
