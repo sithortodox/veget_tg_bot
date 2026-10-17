@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
+import struct
 from dataclasses import dataclass, field
 from typing import Optional, Protocol
 
@@ -45,8 +46,28 @@ class GeocodeResult:
     provider: str = ""
 
 
+def _point_from_wkb(data: str | bytes | memoryview) -> GeoPoint:
+    """Разбирает WKB/EWKB POINT (в т.ч. hex-строку) → GeoPoint без shapely."""
+    if isinstance(data, memoryview):
+        data = data.tobytes()
+    if isinstance(data, str):
+        data = bytes.fromhex(data)
+    endian = "<" if data[0] == 1 else ">"
+    (type_code,) = struct.unpack_from(endian + "I", data, 1)
+    offset = 5
+    if type_code & 0x20000000:  # есть SRID (EWKB)
+        offset += 4
+    lon, lat = struct.unpack_from(endian + "dd", data, offset)
+    return GeoPoint(lat=lat, lon=lon)
+
+
 def point_from_wkt(wkt: str) -> GeoPoint:
-    """Разбирает WKT «POINT(lon lat)» → GeoPoint."""
+    """Разбирает WKT «POINT(lon lat)» → GeoPoint.
+
+    Принимает также WKBElement GeoAlchemy2 (значения из PostGIS-колонок).
+    """
+    if not isinstance(wkt, str):  # WKBElement из PostGIS
+        return _point_from_wkb(wkt.data)
     inner = wkt[wkt.find("(") + 1 : wkt.find(")")]
     lon_s, lat_s = inner.split()
     return GeoPoint(lat=float(lat_s), lon=float(lon_s))

@@ -223,7 +223,9 @@ class OrderService:
                 OrderType.PREORDER.value if is_preorder else OrderType.NOW.value
             ),
             scheduled_at=scheduled_at,
-            delivery_geo=client.address_geo,
+            # client_point уже разобран из address_geo (в т.ч. из WKBElement),
+            # в колонку кладём WKT-строку — иначе GeoAlchemy2 потребует shapely
+            delivery_geo=client_point.wkt,
             delivery_address=client.address_text,
             payment_status=PaymentStatus.PENDING.value,
         )

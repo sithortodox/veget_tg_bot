@@ -24,6 +24,8 @@ class DbSessionMiddleware(BaseMiddleware):
     ) -> Any:
         async with self._session_factory() as session:
             data["session"] = session
+            # Хендлеры этого проекта принимают `data: dict` — даём весь контекст
+            data["data"] = data
             try:
                 result = await handler(event, data)
                 await session.commit()

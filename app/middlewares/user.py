@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiogram import BaseMiddleware
-from aiogram.types import CallbackQuery, Message, TelegramObject
+from aiogram.types import CallbackQuery, Message, TelegramObject, Update
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,11 +21,32 @@ from app.services.ban import BanService
 from app.services.registry import ServiceRegistry
 
 
-def _extract_telegram_id(event: TelegramObject) -> int | None:
-    """Достаёт telegram_id из Message/CallbackQuery."""
+def _extract_telegram_id(event: TelegramObject, data: dict[str, Any]) -> int | None:
+    """Достаёт telegram_id из data aiogram либо напрямую из события.
+
+    Middleware зарегистрирован на уровне апдейтов, поэтому событие может быть
+    Update — в этом случае используем event_from_user из контекста aiogram.
+    """
+    user = data.get("event_from_user")
+    if user is not None:
+        return user.id
     if isinstance(event, (Message, CallbackQuery)):
         if event.from_user:
             return event.from_user.id
+    return None
+
+
+def _extract_message(event: TelegramObject) -> Message | None:
+    """Находит Message для ответа (в т.ч. внутри Update)."""
+    if isinstance(event, Message):
+        return event
+    if isinstance(event, Update):
+        if event.message is not None:
+            return event.message
+        if event.callback_query is not None:
+            return event.callback_query.message
+    if isinstance(event, CallbackQuery):
+        return event.message
     return None
 
 
@@ -53,7 +74,7 @@ class UserLoadingMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
-        telegram_id = _extract_telegram_id(event)
+        telegram_id = _extract_telegram_id(event, data)
         session: AsyncSession | None = data.get("session")
         if session is None or telegram_id is None:
             return await handler(event, data)
@@ -79,13 +100,14 @@ class UserLoadingMiddleware(BaseMiddleware):
         # Проверка активного бана (админы не блокируются)
         is_admin = telegram_id in self._settings.admin_ids or user.role == Role.ADMIN.value
         if not is_admin and BanService.is_currently_banned(user):
-            if isinstance(event, Message):
+            reply = _extract_message(event)
+            if reply is not None:
                 until = (
                     "бессрочно"
                     if user.banned_until is None
                     else f"до {user.banned_until:%d.%m.%Y %H:%M} UTC"
                 )
-                await event.answer(
+                await reply.answer(
                     f"🚫 Доступ ограничен ({until}).\nПричина: {user.ban_reason or 'нарушение правил'}."
                 )
             return None  # не пропускаем дальше
