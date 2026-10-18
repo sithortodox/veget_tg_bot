@@ -7,7 +7,8 @@ services:
       POSTGRES_PASSWORD: ovoshnoy
       POSTGRES_DB: ovoshnoy
     ports:
-      - "5432:5432"
+      # Только localhost: слабые dev-креды не должны быть видны локальной сети
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       # Инициализация схемы при первом старте контейнера
@@ -22,7 +23,7 @@ services:
     image: redis:7-alpine
     ports:
       # 6379 может быть занят другим проектом — используем 6380
-      - "6380:6379"
+      - "127.0.0.1:6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
