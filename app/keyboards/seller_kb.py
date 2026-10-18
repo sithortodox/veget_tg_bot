@@ -109,6 +109,9 @@ def product_actions_keyboard(product_id: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
+                    text="✏️ Изменить", callback_data=f"sp:card:{product_id}"
+                ),
+                InlineKeyboardButton(
                     text="🙈 Скрыть", callback_data=f"sp:hide:{product_id}"
                 ),
                 InlineKeyboardButton(
@@ -117,6 +120,58 @@ def product_actions_keyboard(product_id: int) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def product_edit_fields_keyboard(
+    product_id: int, is_active: bool = True
+) -> InlineKeyboardMarkup:
+    """Выбор поля для редактирования карточки (S3)."""
+    toggle = (
+        InlineKeyboardButton(
+            text="🙈 Скрыть", callback_data=f"sp:hide:{product_id}"
+        )
+        if is_active
+        else InlineKeyboardButton(
+            text="👁 Показать", callback_data=f"sp:show:{product_id}"
+        )
+    )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💲 Цена", callback_data=f"sp:price:{product_id}"
+                ),
+                InlineKeyboardButton(
+                    text="📝 Описание", callback_data=f"sp:desc:{product_id}"
+                ),
+                InlineKeyboardButton(
+                    text="📷 Фото", callback_data=f"sp:photo:{product_id}"
+                ),
+            ],
+            [
+                toggle,
+                InlineKeyboardButton(
+                    text="🗑 Удалить", callback_data=f"sp:del:{product_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="← К витрине", callback_data="sp:list"
+                )
+            ],
+        ]
+    )
+
+
+def product_catalog_keyboard(
+    products: list[tuple[int, str]],
+) -> InlineKeyboardMarkup:
+    """Список карточек витрины: кнопка на каждый товар (S3)."""
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"sp:card:{product_id}")]
+        for product_id, label in products
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def orders_list_keyboard(

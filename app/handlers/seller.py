@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import io
 import logging
 from typing import Optional
@@ -18,13 +19,20 @@ from app.db.models import Order, OrderItem, Product, Shop, SubOrder
 from app.keyboards.common_kb import main_seller_keyboard
 from app.keyboards.seller_kb import (
     orders_list_keyboard,
+    product_catalog_keyboard,
+    product_edit_fields_keyboard,
     sub_card_keyboard,
 )
 from app.services.catalog_import import import_catalog_rows, parse_catalog_rows
 from app.services.order import OrderService
 from app.services.preorder import PreorderService
 from app.services.registry import ServiceRegistry
-from app.states.seller_states import SellerAssemble, SellerProduct, SellerReject
+from app.states.seller_states import (
+    SellerAssemble,
+    SellerProduct,
+    SellerProductEdit,
+    SellerReject,
+)
 
 logger = logging.getLogger(__name__)
 router = Router(name="seller")
@@ -208,29 +216,62 @@ async def seller_open_sub(cb: CallbackQuery, data: dict) -> None:
 
 @router.message(F.text == "🥕 Моя витрина")
 async def menu_catalog(message: Message, data: dict) -> None:
-    """Управление витриной (S2–S4)."""
+    """Управление витриной (S2–S4): карточки товаров с действиями (S3)."""
     session: AsyncSession = data["session"]
     shop = await _get_shop(session, message.from_user.id)
     if shop is None:
         await message.answer("Магазин не найден. /start → «Я магазин».")
         return
+    await _send_catalog(session, shop, message)
+
+
+async def _send_catalog(
+    session: AsyncSession, shop: Shop, target, edit: bool = False
+) -> None:
+    """Список карточек витрины кнопками (включая скрытые — можно вернуть)."""
     result = await session.execute(
         select(Product)
         .where(Product.shop_id == shop.id)
-        .where(Product.is_active.is_(True))
-        .order_by(Product.name)
-        .limit(30)
+        .order_by(Product.is_active.desc(), Product.name)
+        .limit(20)
     )
     products = list(result.scalars().all())
     lines = [f"🥕 Витрина «{shop.name}» ({len(products)} позиций):"]
+    pairs: list[tuple[int, str]] = []
     for p in products:
-        lines.append(f"• {p.name} — {float(p.price):.0f} ₽/{p.unit}  [id:{p.id}]")
+        mark = "" if p.is_active else " 🙈"
+        lines.append(
+            f"• {p.name} — {float(p.price):.0f} ₽/{p.unit}{mark}  [id:{p.id}]"
+        )
+        pairs.append(
+            (p.id, f"{p.name} — {float(p.price):.0f} ₽/{p.unit}{mark}")
+        )
     lines.append(
-        "\n+ добавить: напишите «+товар»\n"
-        "Импорт Excel/CSV: отправьте файл .xlsx или .csv "
+        "\nНажмите позицию, чтобы изменить цену/описание/фото, скрыть или удалить.\n"
+        "+ добавить: напишите «+товар»\n"
+        "Импорт Excel/CSV: файл .xlsx или .csv "
         "(колонки: name,price,unit,description,synonyms)"
     )
-    await message.answer("\n".join(lines)[:4000])
+    text = "\n".join(lines)[:4000]
+    kb = product_catalog_keyboard(pairs)
+    if edit:
+        await target.edit_text(text, reply_markup=kb)
+    else:
+        await target.answer(text, reply_markup=kb)
+
+
+def _product_card_text(product: Product, shop: Shop) -> str:
+    """Текст карточки товара (S3)."""
+    desc = html.escape(product.description) if product.description else "—"
+    status = "активен" if product.is_active else "🙈 скрыт"
+    photo = " 📷" if product.photo_file_id else ""
+    return (
+        f"🥕 {html.escape(product.name)}{photo}\n"
+        f"💰 {float(product.price):.0f} ₽/{product.unit}\n"
+        f"📝 {desc}\n"
+        f"Статус: {status}\n\n"
+        "Что изменить?"
+    )
 
 
 @router.message(F.text == "👤 Профиль магазина")
@@ -634,8 +675,212 @@ async def product_photo_hint(message: Message) -> None:
 
 
 # ----------------------------------------------------------------------
-# Скрытие / удаление карточки (S3)
+# Скрытие / удаление / редактирование карточки (S3)
 # ----------------------------------------------------------------------
+
+
+async def _owned_product(
+    session: AsyncSession, telegram_id: int, product_id: int
+) -> Optional[Product]:
+    """Карточка товара текущего магазина (или None)."""
+    shop = await _get_shop(session, telegram_id)
+    if shop is None:
+        return None
+    product = await session.get(Product, product_id)
+    if product is None or product.shop_id != shop.id:
+        return None
+    return product
+
+
+@router.callback_query(F.data.startswith("sp:card:"))
+async def product_card(cb: CallbackQuery, data: dict) -> None:
+    """Карточка товара: поля + действия (S3)."""
+    session: AsyncSession = data["session"]
+    product_id = int(cb.data.split(":")[2])
+    product = await _owned_product(session, cb.from_user.id, product_id)
+    if product is None:
+        await cb.answer("Не найдено", show_alert=True)
+        return
+    shop = await _get_shop(session, cb.from_user.id)
+    await cb.answer()
+    await cb.message.edit_text(
+        _product_card_text(product, shop),
+        reply_markup=product_edit_fields_keyboard(product.id, product.is_active),
+    )
+
+
+@router.callback_query(F.data == "sp:list")
+async def product_list_back(cb: CallbackQuery, data: dict) -> None:
+    """«← К витрине» из карточки товара."""
+    session: AsyncSession = data["session"]
+    shop = await _get_shop(session, cb.from_user.id)
+    if shop is None:
+        await cb.answer("Магазин не найден", show_alert=True)
+        return
+    await cb.answer()
+    await _send_catalog(session, shop, cb.message, edit=True)
+
+
+@router.callback_query(F.data.startswith("sp:price:"))
+async def product_edit_price_start(cb: CallbackQuery, state: FSMContext, data: dict) -> None:
+    """Просим новую цену."""
+    session: AsyncSession = data["session"]
+    product_id = int(cb.data.split(":")[2])
+    product = await _owned_product(session, cb.from_user.id, product_id)
+    if product is None:
+        await cb.answer("Не найдено", show_alert=True)
+        return
+    await state.set_state(SellerProductEdit.price)
+    await state.update_data(product_id=product.id)
+    await cb.answer()
+    await cb.message.edit_text(
+        f"«{product.name}»: текущая цена {float(product.price):.0f} ₽/{product.unit}.\n"
+        "Введите новую цену числом (например 89 или 89.5):"
+    )
+
+
+@router.message(SellerProductEdit.price, F.text)
+async def product_edit_price_save(message: Message, state: FSMContext, data: dict) -> None:
+    """Сохраняем новую цену."""
+    session: AsyncSession = data["session"]
+    fsm = await state.get_data()
+    product = await _owned_product(session, message.from_user.id, fsm["product_id"])
+    if product is None:
+        await state.clear()
+        await message.answer("Карточка не найдена.")
+        return
+    try:
+        price = float(message.text.replace(",", ".").strip())
+    except ValueError:
+        await message.answer("Нужно число, например 89 или 89.5")
+        return
+    product.price = price
+    await session.flush()
+    await state.clear()
+    await message.answer(
+        f"✅ Цена обновлена: {product.name} — {price:.0f} ₽/{product.unit}",
+        reply_markup=product_edit_fields_keyboard(product.id, product.is_active),
+    )
+
+
+@router.callback_query(F.data.startswith("sp:desc:"))
+async def product_edit_desc_start(cb: CallbackQuery, state: FSMContext, data: dict) -> None:
+    """Просим новое описание."""
+    session: AsyncSession = data["session"]
+    product_id = int(cb.data.split(":")[2])
+    product = await _owned_product(session, cb.from_user.id, product_id)
+    if product is None:
+        await cb.answer("Не найдено", show_alert=True)
+        return
+    await state.set_state(SellerProductEdit.description)
+    await state.update_data(product_id=product.id)
+    await cb.answer()
+    current = product.description or "—"
+    await cb.message.edit_text(
+        f"«{product.name}»: описание «{current}».\n"
+        "Введите новое описание (или «-», чтобы убрать):"
+    )
+
+
+@router.message(SellerProductEdit.description, F.text)
+async def product_edit_desc_save(message: Message, state: FSMContext, data: dict) -> None:
+    """Сохраняем описание."""
+    session: AsyncSession = data["session"]
+    fsm = await state.get_data()
+    product = await _owned_product(session, message.from_user.id, fsm["product_id"])
+    if product is None:
+        await state.clear()
+        await message.answer("Карточка не найдена.")
+        return
+    text = message.text.strip()
+    product.description = None if text == "-" else text
+    await session.flush()
+    await state.clear()
+    await message.answer(
+        f"✅ Описание обновлено: {product.name}",
+        reply_markup=product_edit_fields_keyboard(product.id, product.is_active),
+    )
+
+
+@router.callback_query(F.data.startswith("sp:photo:"))
+async def product_edit_photo_start(cb: CallbackQuery, state: FSMContext, data: dict) -> None:
+    """Просим новое фото."""
+    session: AsyncSession = data["session"]
+    product_id = int(cb.data.split(":")[2])
+    product = await _owned_product(session, cb.from_user.id, product_id)
+    if product is None:
+        await cb.answer("Не найдено", show_alert=True)
+        return
+    await state.set_state(SellerProductEdit.photo)
+    await state.update_data(product_id=product.id)
+    await cb.answer()
+    await cb.message.edit_text(
+        f"«{product.name}»: пришлите новое фото товара "
+        "или отправьте «-», чтобы убрать фото:"
+    )
+
+
+@router.message(SellerProductEdit.photo, F.photo)
+async def product_edit_photo_save(message: Message, state: FSMContext, data: dict) -> None:
+    """Сохраняем фото."""
+    session: AsyncSession = data["session"]
+    fsm = await state.get_data()
+    product = await _owned_product(session, message.from_user.id, fsm["product_id"])
+    if product is None:
+        await state.clear()
+        await message.answer("Карточка не найдена.")
+        return
+    product.photo_file_id = message.photo[-1].file_id
+    await session.flush()
+    await state.clear()
+    await message.answer(
+        f"✅ Фото обновлено: {product.name} 📷",
+        reply_markup=product_edit_fields_keyboard(product.id, product.is_active),
+    )
+
+
+@router.message(SellerProductEdit.photo, F.text == "-")
+async def product_edit_photo_clear(message: Message, state: FSMContext, data: dict) -> None:
+    """Убираем фото."""
+    session: AsyncSession = data["session"]
+    fsm = await state.get_data()
+    product = await _owned_product(session, message.from_user.id, fsm["product_id"])
+    if product is None:
+        await state.clear()
+        await message.answer("Карточка не найдена.")
+        return
+    product.photo_file_id = None
+    await session.flush()
+    await state.clear()
+    await message.answer(
+        f"✅ Фото убрано: {product.name}",
+        reply_markup=product_edit_fields_keyboard(product.id, product.is_active),
+    )
+
+
+@router.message(SellerProductEdit.photo)
+async def product_edit_photo_hint(message: Message) -> None:
+    """Не то сообщение — повторяем просьбу."""
+    await message.answer("📷 Отправьте фото или «-», без фото:")
+
+
+@router.callback_query(F.data.startswith("sp:show:"))
+async def product_show(cb: CallbackQuery, data: dict) -> None:
+    """Вернуть товар на витрину."""
+    session: AsyncSession = data["session"]
+    product_id = int(cb.data.split(":")[2])
+    product = await _owned_product(session, cb.from_user.id, product_id)
+    if product is None:
+        await cb.answer("Не найдено", show_alert=True)
+        return
+    product.is_active = True
+    await session.flush()
+    await cb.answer("Показан")
+    shop = await _get_shop(session, cb.from_user.id)
+    await cb.message.edit_text(
+        _product_card_text(product, shop),
+        reply_markup=product_edit_fields_keyboard(product.id, product.is_active),
+    )
 
 
 @router.callback_query(F.data.startswith("sp:hide:"))
@@ -643,15 +888,18 @@ async def product_hide(cb: CallbackQuery, data: dict) -> None:
     """Скрыть товар с витрины."""
     session: AsyncSession = data["session"]
     product_id = int(cb.data.split(":")[2])
-    shop = await _get_shop(session, cb.from_user.id)
-    product = await session.get(Product, product_id)
-    if product is None or (shop and product.shop_id != shop.id):
+    product = await _owned_product(session, cb.from_user.id, product_id)
+    if product is None:
         await cb.answer("Не найдено", show_alert=True)
         return
     product.is_active = False
     await session.flush()
     await cb.answer("Скрыт")
-    await cb.message.edit_text(f"«{product.name}» скрыт с витрины.")
+    shop = await _get_shop(session, cb.from_user.id)
+    await cb.message.edit_text(
+        _product_card_text(product, shop),
+        reply_markup=product_edit_fields_keyboard(product.id, product.is_active),
+    )
 
 
 @router.callback_query(F.data.startswith("sp:del:"))
@@ -659,15 +907,15 @@ async def product_delete(cb: CallbackQuery, data: dict) -> None:
     """Удалить карточку."""
     session: AsyncSession = data["session"]
     product_id = int(cb.data.split(":")[2])
-    shop = await _get_shop(session, cb.from_user.id)
-    product = await session.get(Product, product_id)
-    if product is None or (shop and product.shop_id != shop.id):
+    product = await _owned_product(session, cb.from_user.id, product_id)
+    if product is None:
         await cb.answer("Не найдено", show_alert=True)
         return
+    name = product.name
     await session.delete(product)
     await session.flush()
     await cb.answer("Удалён")
-    await cb.message.edit_text("Карточка удалена.")
+    await cb.message.edit_text(f"Карточка «{name}» удалена.")
 
 
 # ----------------------------------------------------------------------

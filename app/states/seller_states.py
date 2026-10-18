@@ -22,6 +22,14 @@ class SellerProduct(StatesGroup):
     photo = State()  # прикрепить фото карточки или «-»
 
 
+class SellerProductEdit(StatesGroup):
+    """Редактирование карточки товара (S3)."""
+
+    price = State()
+    description = State()
+    photo = State()
+
+
 class SellerAssemble(StatesGroup):
     """Фактическое количество при сборке (§5.1)."""
 
