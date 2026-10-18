@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import Settings
 from app.services.ban import BanService
 from app.services.delivery import DeliveryService
-from app.services.geo import GeoService, build_geo_service
+from app.services.geo import build_geo_service
 from app.services.matcher import ProductMatcher
 from app.services.notifier import Notifier
 from app.services.order import OrderService

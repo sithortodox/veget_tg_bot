@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,12 +13,10 @@ from app.constants import (
     OrderType,
     PaymentMethod,
     PreorderEvent,
-    SubOrderStatus,
 )
 from app.db.models import BanHistory, Order, PreorderLog, User
 from tests.conftest import make_product, make_shop, make_user
 from tests.services_fixture import ServiceStack
-
 
 # ======================================================================
 # БАНЫ (§5.4)

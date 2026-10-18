@@ -255,7 +255,8 @@ class PreorderService:
                 session,
                 client.telegram_id,
                 f"⚠️ Магазин не подтвердил предзаказ #{order.id}.\n"
-                f"Ищем другой магазин...\n✅ Нашли: заказ #{new_order.id} оформлен у других продавцов.\n{msg}",
+                f"Ищем другой магазин...\n"
+                f"✅ Нашли: заказ #{new_order.id} оформлен у других продавцов.\n{msg}",
             )
         else:
             await self._notifier.send(

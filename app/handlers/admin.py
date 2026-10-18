@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-from aiogram import F, Router
+from aiogram import Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import Message
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.constants import Role
 from app.db.models import BanHistory, Order, Shop, User
-from app.handlers.common import _services
 from app.services.ban import BanService
 from app.services.registry import ServiceRegistry
 

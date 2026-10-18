@@ -10,7 +10,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import Settings
 from app.constants import ModerationStatus, Role
 from app.db.models import Shop, User
 from app.keyboards.common_kb import (
@@ -75,7 +74,8 @@ async def cmd_help(message: Message) -> None:
     """Справка."""
     await message.answer(
         "«ОВОЩНОЙ» — заказ продуктов в 1 сообщение.\n\n"
-        "🛒 Покупатель: пришлите список → подтвердите предзаказ → заберите/получите → оплатите при получении.\n"
+        "🛒 Покупатель: пришлите список → подтвердите предзаказ → "
+        "заберите/получите → оплатите при получении.\n"
         "🏪 Магазин: подтверждайте наличие, собирайте, отмечайте оплату.\n"
         "🛵 Курьер: берите доставки, отмечайте забор и доставку.\n\n"
         "/start — главное меню"
@@ -122,7 +122,6 @@ async def role_seller(
 ) -> None:
     """Продавец: регистрация магазина."""
     await cb.answer()
-    services: ServiceRegistry = _services(data)
     session: AsyncSession = data["session"]
     # Уже есть магазин?
     from sqlalchemy import select

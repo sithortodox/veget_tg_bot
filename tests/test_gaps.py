@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-from typing import Optional
 
 import pytest
 from sqlalchemy import select
@@ -15,13 +14,12 @@ from app.constants import (
     PaymentMethod,
     SubOrderStatus,
 )
-from app.db.models import Order, Product
+from app.db.models import Product
 from app.services.catalog_import import import_catalog_rows, parse_catalog_rows
 from app.services.delivery import DeliveryService
 from app.services.geo import clamp_search_radius
 from tests.conftest import make_product, make_shop, make_user
 from tests.services_fixture import ServiceStack
-
 
 # ======================================================================
 # 1. Excel/CSV-импорт каталога (S4)

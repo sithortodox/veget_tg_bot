@@ -6,23 +6,18 @@ import logging
 from datetime import datetime, timezone
 
 from aiogram import F, Router
-from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.constants import (
     DeliveryType,
     OrderStatus,
-    PaymentMethod,
     Role,
 )
-from app.db.models import Order, OrderItem, SubOrder, User
-from app.handlers.common import _services
+from app.db.models import Order, User
 from app.keyboards.client_kb import (
-    approve_preorder_keyboard,
     delivery_keyboard,
     history_keyboard,
     payment_keyboard,
@@ -80,7 +75,11 @@ async def menu_orders(message: Message, data: dict) -> None:
         total = float(o.total_actual or o.total_estimated or 0)
         label = f"#{o.id} {status} · {total:.0f} ₽"
         lines.append(f"• {label} — {o.created_at:%d.%m %H:%M}")
-        if o.status in (OrderStatus.DONE.value, OrderStatus.CANCELLED.value, OrderStatus.NO_SHOW.value):
+        if o.status in (
+            OrderStatus.DONE.value,
+            OrderStatus.CANCELLED.value,
+            OrderStatus.NO_SHOW.value,
+        ):
             pairs.append((o.id, f"#{o.id} · {total:.0f} ₽"))
     text = "📦 Ваши заказы:\n" + "\n".join(lines)
     if pairs:

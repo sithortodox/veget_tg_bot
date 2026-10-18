@@ -103,7 +103,10 @@ class DaDataGeocoder:
         if self._secret:
             payload["locations"] = [{"country": "RU"}]
         async with aiohttp.ClientSession(headers=self._headers) as session:
-            async with session.post(self.SUGGEST_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            request_timeout = aiohttp.ClientTimeout(total=10)
+            async with session.post(
+                self.SUGGEST_URL, json=payload, timeout=request_timeout
+            ) as resp:
                 if resp.status != 200:
                     logger.warning("DaData HTTP %s", resp.status)
                     return None

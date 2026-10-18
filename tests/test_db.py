@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -154,7 +153,6 @@ async def test_order_cascade_delete(db: AsyncSession) -> None:
 
 async def test_gin_trgm_index_on_product_name(db: AsyncSession) -> None:
     """Индекс gin_trgm на имени товара существует и используется в ILIKE."""
-    from sqlalchemy import select
 
     shop = await make_shop(db)
     await make_product(db, shop, name="Банан экзотический")

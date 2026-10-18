@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.constants import BAN_LEVELS, Role
+from app.constants import BAN_LEVELS
 from app.db.models import BanHistory, User
 from app.services.notifier import Notifier
 

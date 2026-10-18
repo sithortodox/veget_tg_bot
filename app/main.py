@@ -140,7 +140,12 @@ async def amain() -> None:
                 detail = f" chat={event.message.chat.id} text={event.message.text!r}"
             elif event.callback_query is not None:
                 kind = "callback"
-                detail = f" chat={event.callback_query.message.chat.id if event.callback_query.message else '?'} data={event.callback_query.data!r}"
+                chat_id = (
+                    event.callback_query.message.chat.id
+                    if event.callback_query.message
+                    else "?"
+                )
+                detail = f" chat={chat_id} data={event.callback_query.data!r}"
             logger.debug("UPDATE #%s %s%s", event.update_id, kind, detail)
         return await handler(event, data)
 

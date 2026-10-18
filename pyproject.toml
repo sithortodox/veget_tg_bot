@@ -1,0 +1,14 @@
+# Конфигурация инструментов (требования приложений — в requirements.txt)
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = [".venv", "tests"]
+
+[tool.ruff.lint]
+# Классическая связка: ошибки, импорты, форматирование импортов
+select = ["E", "F", "W", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# Тесты: свободный стиль, массовые импорты фикстур
+"tests/**" = ["E501", "E741", "E402"]

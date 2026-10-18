@@ -34,6 +34,20 @@ python -m app.main
 Схема БД накатывается автоматически из `sql/init.sql` при старте docker-контейнера `db`.
 Дополнительно `main.py` выполняет `create_all` для разработки (идемпотентно).
 
+## Тесты и линт
+
+```bash
+pip install -r requirements-dev.txt
+
+# Тесты интеграционные — используют ту же БД/Redis, что и бот:
+# перед прогоном остановите бота, после — таблицы пусты (данные не восстанавливаются)
+docker compose up -d
+systemctl --user stop veget-bot   # или ваш способ остановки
+pytest
+
+ruff check app tests
+```
+
 ## Структура
 
 ```
@@ -58,7 +72,7 @@ app/
    из `data["services"]`.
 2. **Новый обработчик** — модуль в `app/handlers/` с экспортом `router`;
    подхватывается автоматически в `app/handlers/__init__.py` (или добавьте
-   вручную в список `ROLE_ROUTERS`).
+   вручную в список `CORE_MODULES`).
 3. **Плагин** — модуль в `app/plugins/` с функцией `register(ctx)`.
    Перечислите имя модуля в `PLUGINS` в `app/plugins/__init__.py`.
    Плагину доступны bot, dp, services, config — ядро не правится.

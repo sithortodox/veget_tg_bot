@@ -24,7 +24,6 @@ from app.constants import (
     ItemStatus,
     OrderStatus,
     OrderType,
-    PaymentMethod,
     PaymentStatus,
     PreorderEvent,
     SubOrderStatus,
@@ -35,7 +34,6 @@ from app.db.models import (
     OrderStatusLog,
     PreorderLog,
     Product,
-    Shop,
     SubOrder,
     User,
 )
@@ -43,7 +41,7 @@ from app.services.ban import BanService
 from app.services.geo import GeoPoint, GeoService
 from app.services.matcher import MatchResult, ProductMatcher
 from app.services.notifier import Notifier
-from app.services.parser import ParsedPosition, ProductParser
+from app.services.parser import ProductParser
 from app.services.scheduler import (
     SchedulerService,
     job_id_assemble,
@@ -490,7 +488,6 @@ class OrderService:
         await session.flush()
 
         if order.order_type == OrderType.PREORDER.value:
-            from app.services.preorder import PreorderService  # локальный импорт
 
             # Логирование события предзаказа делает PreorderService;
             # здесь фиксируем факт ответа
@@ -819,7 +816,8 @@ class OrderService:
         from app.keyboards.client_kb import ready_keyboard
 
         # Адреса магазинов для самовывоза / инструкция для доставки
-        lines = [f"✅ Заказ #{order.id} собран!", f"💰 Итого: {float(order.total_actual or 0):.0f} ₽"]
+        total_actual = float(order.total_actual or 0)
+        lines = [f"✅ Заказ #{order.id} собран!", f"💰 Итого: {total_actual:.0f} ₽"]
         if order.delivery_type == DeliveryType.PICKUP.value or order.delivery_type is None:
             lines.append("📍 Заберите:")
             for s in order.sub_orders:
@@ -831,7 +829,6 @@ class OrderService:
         else:
             lines.append("🛵 Курьер заберёт и доставит вам.")
             # Назначаем курьера
-            from app.services.delivery import DeliveryService
 
             # delivery сервис доступен через реестр? используем локально
             pass
@@ -909,7 +906,7 @@ class OrderService:
         lines.append(
             f"🏠 Доставить: {order.delivery_address or 'адрес клиента в профиле'}"
         )
-        lines.append(f"💰 К оплате курьером не принимается — постоплата покупателю.")
+        lines.append("💰 К оплате курьером не принимается — постоплата покупателю.")
         await self._notifier.send(
             session,
             courier.telegram_id,
@@ -1036,7 +1033,11 @@ class OrderService:
         )
 
     async def seller_got_cash(
-        self, session: AsyncSession, order: Order, sub_order: SubOrder, changed_by: Optional[int] = None
+        self,
+        session: AsyncSession,
+        order: Order,
+        sub_order: SubOrder,
+        changed_by: Optional[int] = None,
     ) -> None:
         """Продавец подтвердил выдачу/получение денег при самовывозе."""
         sub_order.status = SubOrderStatus.PICKED_UP.value

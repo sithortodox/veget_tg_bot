@@ -10,9 +10,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.constants import DeliveryType, OrderStatus, Role
-from app.db.models import Order, Shop, SubOrder, User
-from app.handlers.common import _services
+from app.constants import OrderStatus, Role
+from app.db.models import Order, SubOrder, User
 from app.keyboards.courier_kb import courier_order_keyboard
 from app.services.order import OrderService
 from app.services.registry import ServiceRegistry
@@ -49,7 +48,8 @@ async def menu_deliveries(message: Message, data: dict) -> None:
         for sub in order.sub_orders:
             if sub.shop:
                 lines.append(f"🏪 «{sub.shop.name}», {sub.shop.address_text}")
-        lines.append(f"🏠 {order.delivery_address or (order.client.address_text if order.client else '—')}")
+        client_addr = order.client.address_text if order.client else "—"
+        lines.append(f"🏠 {order.delivery_address or client_addr}")
         await message.answer(
             "\n".join(lines), keyboard=courier_order_keyboard(order.id)
         )

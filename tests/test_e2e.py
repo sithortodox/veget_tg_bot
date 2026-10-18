@@ -8,13 +8,14 @@ FakeTelegramSession: вызовы записываются, ответы под�
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any
 
 import pytest_asyncio
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Chat, Message as TgMessage, Update
+from aiogram.types import Chat
+from aiogram.types import Message as TgMessage
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,7 +32,6 @@ from app.middlewares import DbSessionMiddleware, UserMiddleware
 from tests.conftest import make_product, make_shop, make_user
 from tests.services_fixture import ServiceStack
 
-
 # ----------------------------------------------------------------------
 # Мок-сессия Telegram API
 # ----------------------------------------------------------------------
@@ -39,7 +39,7 @@ from tests.services_fixture import ServiceStack
 
 def _fake_response(method: Any) -> Any:
     """Ответ Telegram API для перехваченного метода."""
-    from aiogram.methods import EditMessageText, SendPhoto, SendMessage
+    from aiogram.methods import EditMessageText, SendMessage, SendPhoto
 
     now = dt.datetime.now(dt.timezone.utc)
     if isinstance(method, (SendMessage, SendPhoto)):
@@ -197,7 +197,7 @@ async def e2e(db, stack) -> E2EDriver:
 async def test_e2e_full_pickup_scenario(e2e: E2EDriver) -> None:
     """Полный путь заказа самовывозом: 2 магазина, один отказал, факт-вес, оплата."""
     db = e2e.db
-    client = await make_user(db, telegram_id=1001, lat=45.0443, lon=38.9763)
+    _client = await make_user(db, telegram_id=1001, lat=45.0443, lon=38.9763)
     shop_a = await make_shop(db, telegram_id=2001, name="У Пети")
     shop_b = await make_shop(db, telegram_id=2002, name="У Маши")
     await make_product(db, shop_a, name="Капуста", price=50, unit="кг")
@@ -319,7 +319,7 @@ async def test_e2e_full_pickup_scenario(e2e: E2EDriver) -> None:
 async def test_e2e_buyer_sees_photo_when_ready(e2e: E2EDriver) -> None:
     """Мини-E2E: карточка с фото → покупатель получает фото при готовности."""
     db = e2e.db
-    client = await make_user(db, telegram_id=1101, lat=45.0443, lon=38.9763)
+    _client = await make_user(db, telegram_id=1101, lat=45.0443, lon=38.9763)
     shop = await make_shop(db, telegram_id=2101, name="Фруктовый")
     product = await make_product(db, shop, name="Яблоки", price=90, unit="кг")
     product.photo_file_id = "AgACAgIAAxkB-test-photo"

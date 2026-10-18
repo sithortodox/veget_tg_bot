@@ -108,7 +108,8 @@ class UserLoadingMiddleware(BaseMiddleware):
                     else f"до {user.banned_until:%d.%m.%Y %H:%M} UTC"
                 )
                 await reply.answer(
-                    f"🚫 Доступ ограничен ({until}).\nПричина: {user.ban_reason or 'нарушение правил'}."
+                    f"🚫 Доступ ограничен ({until}).\n"
+                    f"Причина: {user.ban_reason or 'нарушение правил'}."
                 )
             return None  # не пропускаем дальше
 

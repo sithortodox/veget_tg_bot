@@ -13,18 +13,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.constants import ItemStatus, Role, SubOrderStatus, VALID_UNITS
-from app.db.models import Order, Product, Shop, SubOrder, User
-from app.handlers.common import _services
+from app.constants import VALID_UNITS, SubOrderStatus
+from app.db.models import Order, Product, Shop, SubOrder
 from app.keyboards.common_kb import main_seller_keyboard
 from app.keyboards.seller_kb import (
     orders_list_keyboard,
-    product_actions_keyboard,
-    sub_assembled_keyboard,
-    sub_confirm_keyboard,
 )
 from app.services.catalog_import import import_catalog_rows, parse_catalog_rows
-from app.services.notifier import Notifier
 from app.services.order import OrderService
 from app.services.preorder import PreorderService
 from app.services.registry import ServiceRegistry
