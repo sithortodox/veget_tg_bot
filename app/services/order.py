@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import select
+from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -512,8 +513,39 @@ class OrderService:
         await self._try_finalize_sellers(session, order)
 
     async def _try_finalize_sellers(self, session: AsyncSession, order: Order) -> None:
-        """Когда все магазины ответили — собираем предзаказ для покупателя."""
-        statuses = {s.status for s in order.sub_orders}
+        """Когда все магазины ответили — собираем предзаказ для покупателя.
+
+        Финализация приходит из разных сессий (таймауты планировщика,
+        ответы продавцов в чате), поэтому:
+        - сериализуемся advisory-блокировкой по заказу — последний вошедший
+          видит закоммиченные статусы остальных;
+        - статусы читаем свежим SELECT, а не из кэша сессии — иначе два
+          параллельных job'а видят друг друга «pending», оба пропускают
+          финализацию и заказ навсегда зависает в pending_sellers.
+
+        Advisory-лок снимается на коммите транзакции (`_xact_lock`) и не
+        конфликтует с row-локами подзаказов — дедлок невозможен.
+        """
+        await session.execute(
+            sa_text("SELECT pg_advisory_xact_lock(1001, :order_id)"),
+            {"order_id": order.id},
+        )
+        rows = (
+            await session.execute(
+                select(
+                    SubOrder.id,
+                    SubOrder.status,
+                    SubOrder.subtotal_estimated,
+                )
+                .where(SubOrder.order_id == order.id)
+                .order_by(SubOrder.id)
+            )
+        ).all()
+        fresh = {row.id: (row.status, row.subtotal_estimated) for row in rows}
+        for sub in order.sub_orders:
+            if sub.id in fresh:
+                sub.status, sub.subtotal_estimated = fresh[sub.id]
+        statuses = {status for status, _ in fresh.values()}
         unresolved = {
             SubOrderStatus.PENDING.value,
             SubOrderStatus.ASSEMBLING.value,

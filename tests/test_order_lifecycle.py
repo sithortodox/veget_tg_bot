@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -294,6 +295,59 @@ async def test_seller_timeout_excludes_shop(db: AsyncSession, stack: ServiceStac
     assert order.status == OrderStatus.PENDING_CLIENT.value
     silent_sub = next(s for s in order.sub_orders if s.id == silent.id)
     assert silent_sub.status == SubOrderStatus.REJECTED.value
+
+
+async def test_parallel_seller_timeouts_cancels_order(
+    db: AsyncSession, session_factory, stack: ServiceStack
+) -> None:
+    """Гонка таймаутов: два job'а в разных сессиях не зависают в pending_sellers (§11.1).
+
+    Регрессия: если финализация читает устаревший кэш сессии, каждый job
+    видит подзаказ другого ещё PENDING — оба пропускают финализацию и
+    заказ навсегда остаётся в pending_sellers.
+    """
+    from sqlalchemy import select
+
+    from app.db.models import Product
+
+    client, shops = await _prepare_catalog(db, 2)
+    # Силой разводим позиции по магазинам, чтобы получилось 2 подзаказа
+    prods = await db.execute(select(Product))
+    for p in prods.scalars():
+        if p.shop_id == shops[0].id and p.name == "Огурцы":
+            p.is_active = False
+        if p.shop_id == shops[1].id and p.name == "Помидоры":
+            p.is_active = False
+    await db.commit()
+
+    order, _ = await stack.orders.create_from_text(
+        db, client, "помидоры 2 кг, огурцы 1 кг"
+    )
+    await db.commit()
+    assert order is not None
+    assert len(order.sub_orders) == 2
+    shop_ids = [s.shop_id for s in order.sub_orders]
+
+    # job1: исключает магазин, но ещё не коммитит ( открытая транзакция )
+    async with session_factory() as s1:
+        await stack.orders.handle_seller_confirm_timeout(s1, order.id, shop_ids[0])
+
+        # job2 стартует параллельно, пока job1 не завершился
+        async with session_factory() as s2:
+            task = asyncio.create_task(
+                stack.orders.handle_seller_confirm_timeout(s2, order.id, shop_ids[1])
+            )
+            await asyncio.sleep(0.1)
+            await s1.commit()
+            await asyncio.wait_for(task, timeout=10)
+            await s2.commit()
+
+    # Оба магазина исключены → заказ обязан быть закрыт, а не зависнуть
+    async with session_factory() as s3:
+        fresh = (
+            await s3.execute(select(Order).where(Order.id == order.id))
+        ).scalar_one()
+        assert fresh.status == OrderStatus.CANCELLED.value
 
 
 async def test_client_approve_timeout_cancels(db: AsyncSession, stack: ServiceStack) -> None:
