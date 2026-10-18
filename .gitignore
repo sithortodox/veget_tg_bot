@@ -8,3 +8,4 @@ __pycache__/
 .idea/
 .vscode/
 *.log
+run_local.py

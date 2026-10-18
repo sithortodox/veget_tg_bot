@@ -141,11 +141,17 @@ async def amain() -> None:
     )
     await load_plugins(ctx)
 
-    # --- Старт/стоп хуки ---
-    dp.startup.register(
-        lambda: on_startup(engine, registry, scheduler, registry.get("preorders"), session_factory)
-    )
-    dp.shutdown.register(lambda: on_shutdown(scheduler))
+    # --- Старт/стоп хуки (async — иначе aiogram не дождётся корутины) ---
+    async def _startup_hook() -> None:
+        await on_startup(
+            engine, registry, scheduler, registry.get("preorders"), session_factory
+        )
+
+    async def _shutdown_hook() -> None:
+        await on_shutdown(scheduler)
+
+    dp.startup.register(_startup_hook)
+    dp.shutdown.register(_shutdown_hook)
 
     try:
         # Удаляем вебхуки и запускаем long-polling
