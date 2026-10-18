@@ -36,8 +36,9 @@ def setup_logging(settings: Settings) -> None:
         level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    # Тихие библиотеки
-    logging.getLogger("aiogram").setLevel(logging.WARNING)
+    # Тихие библиотеки (в DEBUG показываем их целиком — диагностика сети/API)
+    aiogram_level = logging.DEBUG if settings.debug else logging.WARNING
+    logging.getLogger("aiogram").setLevel(aiogram_level)
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 
@@ -106,6 +107,11 @@ async def amain() -> None:
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    if settings.debug:
+        # DEBUG: логируем каждый исходящий вызов Telegram API
+        from aiogram.client.session.middlewares.request_logging import RequestLogging
+
+        bot.session.middleware(RequestLogging())
     # FSM в Redis (MemoryStorage — только для отладки без Redis)
     try:
         redis = Redis.from_url(settings.redis_url, decode_responses=True)
@@ -123,7 +129,22 @@ async def amain() -> None:
         settings, bot, session_factory
     )
 
-    # --- Middleware (порядок важен: сначала сессия, затем пользователь) ---
+    # --- Middleware (порядок важен: след, сессия, затем пользователь) ---
+    async def _trace_update(handler, event, data):
+        """DEBUG-след входящих апдейтов (видно только при DEBUG=true)."""
+        if logger.isEnabledFor(logging.DEBUG):
+            kind = "other"
+            detail = ""
+            if event.message is not None:
+                kind = "message"
+                detail = f" chat={event.message.chat.id} text={event.message.text!r}"
+            elif event.callback_query is not None:
+                kind = "callback"
+                detail = f" chat={event.callback_query.message.chat.id if event.callback_query.message else '?'} data={event.callback_query.data!r}"
+            logger.debug("UPDATE #%s %s%s", event.update_id, kind, detail)
+        return await handler(event, data)
+
+    dp.update.middleware(_trace_update)
     dp.update.middleware(DbSessionMiddleware(session_factory))
     dp.update.middleware(UserMiddleware(registry, settings).__call__())
 
