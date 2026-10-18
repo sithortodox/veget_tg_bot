@@ -38,7 +38,7 @@ from app.db.models import (
     User,
 )
 from app.services.ban import BanService
-from app.services.geo import GeoPoint, GeoService
+from app.services.geo import GeoPoint, GeoService, haversine_m, point_from_wkt
 from app.services.matcher import MatchResult, ProductMatcher
 from app.services.notifier import Notifier
 from app.services.parser import ProductParser
@@ -198,8 +198,12 @@ class OrderService:
         shop_by_id = {s.id: s for s in shops}
         catalog = [(p, shop_by_id[p.shop_id]) for p in products]
 
-        # 5. Fuzzy-матчинг позиций (§8.3)
-        matches = self._matcher.match(positions, catalog)
+        # 5. Fuzzy-матчинг позиций (§8.3); при равном сходстве — ближайший (C5)
+        distances = {
+            s.id: haversine_m(client_point, point_from_wkt(s.address_geo))
+            for s in shops
+        }
+        matches = self._matcher.match(positions, catalog, distances=distances)
         found = [m for m in matches if m.product is not None]
         if not found:
             return None, (

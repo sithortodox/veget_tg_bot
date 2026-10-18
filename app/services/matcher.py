@@ -58,10 +58,13 @@ class ProductMatcher:
         self,
         positions: list[ParsedPosition],
         products: list[tuple[Product, Shop]],
+        distances: Optional[dict[int, float]] = None,
     ) -> list[MatchResult]:
         """Сопоставляет каждую позицию с лучшим товаром из переданного набора.
 
         `products` — пары (товар, магазин), обычно уже отфильтрованные по радиусу.
+        `distances` — «id магазина → метры до покупателя»: при равном сходстве
+        (одинаковые названия в разных магазинах) побеждает ближайший (§3.2 C5).
         """
         if not products:
             return [
@@ -69,19 +72,19 @@ class ProductMatcher:
                 for p in positions
             ]
 
-        # Словарь «ключ поиска → (product, shop)»; ключ включает синонимы
+        # Словарь «ключ поиска → все кандидаты»; ключ включает синонимы
         # и стеммы (чтобы «огурец» находил «Огурцы» и наоборот)
-        choices: dict[str, tuple[Product, Shop]] = {}
+        choices: dict[str, list[tuple[Product, Shop]]] = {}
         for product, shop in products:
             keys = [product.name]
             if product.synonyms:
                 keys.extend(product.synonyms)
             for key in keys:
                 lk = key.lower()
-                choices[lk] = (product, shop)
+                choices.setdefault(lk, []).append((product, shop))
                 sk = _stem_text(lk)
-                if sk and sk not in choices:
-                    choices[sk] = (product, shop)
+                if sk and sk != lk:
+                    choices.setdefault(sk, []).append((product, shop))
 
         keys_list = list(choices.keys())
         results: list[MatchResult] = []
@@ -92,31 +95,46 @@ class ProductMatcher:
                     MatchResult(position=position, product=None, shop=None, score=0.0)
                 )
                 continue
-            best = process.extractOne(
+            scored = process.extract(
                 query,
                 keys_list,
                 scorer=fuzz.WRatio,
                 score_cutoff=self._threshold,
+                limit=None,
             )
-            if best is None:
-                # Запасной проход: тот же запрос по стеммам (ед./мн. число,
-                # падежные окончания) — если «огурец» не нашёлся в «огурцы»
+            if not scored:
+                # Запасной проход по стеммам: ед./мн. число, падежи
                 stemmed = _stem_text(query)
                 if stemmed and stemmed != query:
-                    best = process.extractOne(
+                    scored = process.extract(
                         stemmed,
                         keys_list,
                         scorer=fuzz.WRatio,
                         score_cutoff=self._threshold,
+                        limit=None,
                     )
-            if best is None:
+            if not scored:
                 results.append(
                     MatchResult(position=position, product=None, shop=None, score=0.0)
                 )
                 continue
-            key, score, _ = best
-            product, shop = choices[key]
+            # Все ключи с лучшим счётом → все кандидаты → ближайший магазин
+            best_score = scored[0][1]
+            tied_keys = [k for k, s, _ in scored if s == best_score]
+            candidates = [c for k in tied_keys for c in choices[k]]
+            if distances:
+                product, shop = min(
+                    candidates,
+                    key=lambda c: distances.get(c[1].id, float("inf")),
+                )
+            else:
+                product, shop = candidates[0]
             results.append(
-                MatchResult(position=position, product=product, shop=shop, score=score)
+                MatchResult(
+                    position=position,
+                    product=product,
+                    shop=shop,
+                    score=best_score,
+                )
             )
         return results

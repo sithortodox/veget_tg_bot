@@ -153,6 +153,49 @@ def test_match_unknown_position_not_forced() -> None:
     assert _match_one("зелёный лук", catalog).product is None
 
 
+def test_match_nearest_shop_on_tie() -> None:
+    """При одинаковых названиях побеждает ближайший магазин (§3.2 C5)."""
+    near = Shop(
+        id=1,
+        telegram_id=11,
+        name="Рядом",
+        address_text="x",
+        address_geo="POINT(0 0)",
+        phone="1",
+        payment_details="1",
+        is_active=True,
+        moderation_status="approved",
+    )
+    far = Shop(
+        id=2,
+        telegram_id=22,
+        name="Далеко",
+        address_text="x",
+        address_geo="POINT(0 0)",
+        phone="2",
+        payment_details="2",
+        is_active=True,
+        moderation_status="approved",
+    )
+    p_far = Product(shop_id=2, name="Капуста", price=50, unit="кг", synonyms=None, is_active=True)
+    p_near = Product(shop_id=1, name="Капуста", price=55, unit="кг", synonyms=None, is_active=True)
+    position = ParsedPosition(raw="капуста", normalized="капуста")
+    matcher = ProductMatcher(threshold=80)
+
+    # Без дистанций — как раньше, первый кандидат из витрины
+    (r0,) = matcher.match([position], [(p_far, far), (p_near, near)])
+    assert r0.shop.id == 2
+
+    # С дистанциями — ближайший, независимо от порядка витрины
+    (r1,) = matcher.match(
+        [position],
+        [(p_far, far), (p_near, near)],
+        distances={1: 100.0, 2: 500.0},
+    )
+    assert r1.shop.id == 1
+    assert r1.score >= 80
+
+
 def test_stem_collapses_forms() -> None:
     """Стеммер сводит ед./мн. число и род. падеж к общему корню."""
     assert _stem_text("огурец") == _stem_text("огурцы") == "огурц"
@@ -235,3 +278,29 @@ async def test_bare_name_defaults_to_product_unit(db, stack: ServiceStack) -> No
     item = order.sub_orders[0].items[0]
     assert item.qty == 1
     assert item.unit == "кг"
+
+
+# ======================================================================
+# 4. Заказ уходит ближайшему магазину (§3.2 C5)
+# ======================================================================
+
+
+async def test_order_goes_to_nearest_shop(db, stack: ServiceStack) -> None:
+    """Из двух магазинов с одинаковым товаром позицию получает ближайший.
+
+    Ближний создаётся первым (id меньше) — до фикса «последний в витрине»
+    побеждал бы дальний, и продавец рядом с покупателем заказ не получал.
+    """
+    client = await make_user(db, telegram_id=8601)
+    near = await make_shop(db, telegram_id=8611, name="Ближний")
+    far = await make_shop(
+        db, telegram_id=8612, name="Дальний", lat=45.0463, lon=38.9783
+    )
+    await make_product(db, near, name="Капуста", price=55, unit="кг")
+    await make_product(db, far, name="Капуста", price=50, unit="кг")
+    await db.commit()
+
+    order, _ = await stack.orders.create_from_text(db, client, "капуста 2 кг")
+    assert order is not None
+    assert len(order.sub_orders) == 1
+    assert order.sub_orders[0].shop.name == "Ближний"
