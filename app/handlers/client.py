@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timezone
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy import select
@@ -16,15 +17,17 @@ from app.constants import (
     OrderStatus,
     Role,
 )
-from app.db.models import Order, User
+from app.db.models import Order, Product, User
 from app.keyboards.client_kb import (
+    approve_preorder_keyboard,
     delivery_keyboard,
     history_keyboard,
+    order_edit_keyboard,
     payment_keyboard,
     time_keyboard,
 )
 from app.keyboards.common_kb import main_client_keyboard
-from app.services.geo import clamp_search_radius
+from app.services.geo import clamp_search_radius, point_from_wkt
 from app.services.order import OrderService
 from app.services.preorder import PreorderService
 from app.services.registry import ServiceRegistry
@@ -104,6 +107,63 @@ async def menu_profile(message: Message, data: dict) -> None:
 
 
 # ----------------------------------------------------------------------
+# C4: карточки товаров рядом
+# ----------------------------------------------------------------------
+
+
+@router.message(F.text == "🥕 Карточки товаров")
+async def menu_catalog_cards(message: Message, data: dict) -> None:
+    """C4: витрины магазинов рядом с покупателем и карточки товаров."""
+    session: AsyncSession = data["session"]
+    db_user: User = data["db_user"]
+    services: ServiceRegistry = data["services"]
+    if not db_user.address_geo:
+        await message.answer("Сначала укажите адрес: /start → «Я покупатель».")
+        return
+    point = point_from_wkt(db_user.address_geo)
+    shops = await services["geo"].find_nearby_shops(
+        session, point, radius_m=db_user.search_radius_m
+    )
+    if not shops:
+        await message.answer(
+            "Рядом с вами магазинов не нашлось. "
+            "Можно расширить радиус поиска в профиле."
+        )
+        return
+    photos_sent = 0
+    shown = 0
+    for shop in shops:
+        result = await session.execute(
+            select(Product)
+            .where(Product.shop_id == shop.id)
+            .where(Product.is_active.is_(True))
+            .order_by(Product.name)
+            .limit(10)
+        )
+        products = list(result.scalars().all())
+        if not products:
+            continue
+        shown += 1
+        header = f"🏪 {shop.name}"
+        if shop.address_text:
+            header += f"\n📍 {shop.address_text}"
+        lines = [header]
+        for p in products:
+            lines.append(f"• {p.name} — {float(p.price):.0f} ₽/{p.unit}")
+        await message.answer("\n".join(lines)[:4000])
+        for p in products:
+            if photos_sent >= 6 or not p.photo_file_id:
+                continue
+            await message.answer_photo(
+                p.photo_file_id,
+                caption=f"{p.name} — {float(p.price):.0f} ₽/{p.unit} · {shop.name}",
+            )
+            photos_sent += 1
+    if not shown:
+        await message.answer("В магазинах рядом пока нет активных товаров.")
+
+
+# ----------------------------------------------------------------------
 # Радиус поиска (G4: 300–800 м, настраивается)
 # ----------------------------------------------------------------------
 
@@ -163,6 +223,20 @@ async def order_list_received(message: Message, state: FSMContext, data: dict) -
     if not _is_client(db_user) and db_user.address_geo is None:
         await message.answer("Сначала завершите регистрацию: /start")
         return
+
+    # C7: замена списком — отменяем старый заказ и оформляем новый
+    fsm_data = await state.get_data()
+    replace_id = fsm_data.get("edit_order_id")
+    if replace_id:
+        old = await orders.get_order(session, int(replace_id))
+        if old is not None:
+            await orders.client_cancel(
+                session,
+                old,
+                reason="заменён новым списком",
+                changed_by=db_user.telegram_id,
+            )
+        await state.update_data(edit_order_id=None)
 
     await message.answer("🔍 Разбираю список и ищу магазины...")
     order, text = await orders.create_from_text(
@@ -324,14 +398,109 @@ async def order_cancel(cb: CallbackQuery, data: dict) -> None:
 
 
 @router.callback_query(F.data.startswith("oe:"))
-async def order_edit_hint(cb: CallbackQuery, state: FSMContext) -> None:
-    """Подсказка по редактированию (C7): отменить и пересобрать список."""
+async def order_edit_hint(
+    cb: CallbackQuery, state: FSMContext, data: dict
+) -> None:
+    """C7: открыть редактор позиций предзаказа."""
     await cb.answer()
+    session: AsyncSession = data["session"]
+    orders: OrderService = data["services"]["orders"]
+    order_id = int(cb.data.split(":")[1])
+    order = await orders.get_order(session, order_id)
+    if order is None:
+        await cb.message.edit_text("Заказ не найден.")
+        return
+    await state.set_state(ClientOrder.editing)
+    await state.update_data(order_id=order_id)
+    await _render_editor(cb.message, orders, order)
+
+
+async def _render_editor(message: Message, orders: OrderService, order: Order) -> None:
+    """Показывает сводку заказа с кнопками редактирования (C7)."""
+    if order.status != OrderStatus.PENDING_CLIENT.value:
+        try:
+            await message.edit_text(
+                "⚠️ Заказ уже передан в сборку — править состав нельзя."
+            )
+        except TelegramBadRequest:
+            pass
+        return
+    text = orders.preorder_view(order) + (
+        "\n\n✏️ Кнопки: ➕/➖ меняют количество, 🗑 удаляет позицию."
+    )
+    try:
+        await message.edit_text(text, reply_markup=order_edit_keyboard(order))
+    except TelegramBadRequest:
+        pass  # сообщение не изменилось — игнорируем
+
+
+@router.callback_query(F.data.startswith("ei:"))
+async def order_edit_item(cb: CallbackQuery, data: dict) -> None:
+    """C7: правка одной позиции (➕/➖/🗑)."""
+    services: ServiceRegistry = data["services"]
+    session: AsyncSession = data["session"]
+    orders: OrderService = services["orders"]
+    _, order_id_s, item_id_s, action = cb.data.split(":")
+    order = await orders.get_order(session, int(order_id_s))
+    if order is None:
+        await cb.answer("Заказ не найден", show_alert=True)
+        return
+    changed, note = await orders.edit_item(
+        session, order, int(item_id_s), action, changed_by=cb.from_user.id
+    )
+    if not changed:
+        await cb.answer(note, show_alert=True)
+        return
+    await cb.answer(note[:180])
+    if order.status in (
+        OrderStatus.CANCELLED.value,
+        OrderStatus.PREORDER_CANCELLED.value,
+    ):
+        try:
+            await cb.message.edit_text(note)
+        except TelegramBadRequest:
+            pass
+        return
+    await _render_editor(cb.message, orders, order)
+
+
+@router.callback_query(F.data.startswith("edone:"))
+async def order_edit_done(
+    cb: CallbackQuery, state: FSMContext, data: dict
+) -> None:
+    """C7: правка завершена — показываем сводку для утверждения."""
+    await cb.answer("Сохранено")
+    await state.clear()
+    session: AsyncSession = data["session"]
+    orders: OrderService = data["services"]["orders"]
+    order_id = int(cb.data.split(":")[1])
+    order = await orders.get_order(session, order_id)
+    if order is None:
+        await cb.message.edit_text("Заказ не найден.")
+        return
+    text = orders.preorder_view(order)
+    keyboard = (
+        approve_preorder_keyboard(order.id)
+        if order.status == OrderStatus.PENDING_CLIENT.value
+        else None
+    )
+    try:
+        await cb.message.edit_text(text, reply_markup=keyboard)
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data.startswith("erpl:"))
+async def order_edit_replace(cb: CallbackQuery, state: FSMContext) -> None:
+    """C7: заменить заказ списком — отмена старого + новый ввод."""
+    await cb.answer()
+    order_id = int(cb.data.split(":")[1])
     await state.set_state(ClientOrder.waiting_list)
+    await state.update_data(edit_order_id=order_id)
     await cb.message.edit_text(
-        "✏️ Чтобы изменить состав — пришлите новый список сообщением, "
-        "я оформлю заново. Текущий предзаказ можно отменить кнопкой ниже.",
-        reply_markup=None,
+        "✏️ Пришлите новый список одним сообщением:\n"
+        "«капуста 2 кг, помидоры 1 кг».\n"
+        "Текущий заказ будет отменён, оформлю новый."
     )
 
 

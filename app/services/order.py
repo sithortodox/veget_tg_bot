@@ -375,8 +375,9 @@ class OrderService:
                 continue
             for item in sub.items:
                 unit = item.unit or ""
-                qty = item.qty or 0
-                price = item.price or 0
+                # float-приведение: edit_item хранит qty как float, price — Decimal
+                qty = float(item.qty or 0)
+                price = float(item.price or 0)
                 lines.append(
                     f"{idx}. {item.raw_name} — {qty:g} {unit} — ~{qty * price:.0f} ₽"
                     f" ({shop_name})"
@@ -400,6 +401,98 @@ class OrderService:
                 f"{self._settings.preorder_reminder_hours} часов до даты."
             )
         return text
+
+    def preorder_view(self, order: Order) -> str:
+        """Сводка предзаказа для показа покупателю (C6, C7)."""
+        rejected = [
+            s.shop.name
+            for s in order.sub_orders
+            if s.status == SubOrderStatus.REJECTED.value and s.shop
+        ]
+        warn = ("\n⚠️ Отклонены: " + ", ".join(rejected)) if rejected else ""
+        return self._format_preorder(order) + warn
+
+    # ------------------------------------------------------------------
+    # Редактирование предзаказа (C7)
+    # ------------------------------------------------------------------
+
+    async def edit_item(
+        self,
+        session: AsyncSession,
+        order: Order,
+        item_id: int,
+        action: str,
+        changed_by: Optional[int] = None,
+    ) -> tuple[bool, str]:
+        """Правка позиции предзаказа: p=плюс, m=минус, d=удаление.
+
+        Пересчитывает подытог подзаказа и итог заказа. Если удалены все
+        активные позиции — заказ отменяется. Возвращает (изменено, сообщение).
+        """
+        if order.status != OrderStatus.PENDING_CLIENT.value:
+            return False, "⚠️ Заказ уже передан в сборку — править нельзя."
+        target: Optional[OrderItem] = None
+        parent: Optional[SubOrder] = None
+        for sub in order.sub_orders:
+            if sub.status in (
+                SubOrderStatus.REJECTED.value,
+                SubOrderStatus.CANCELLED.value,
+            ):
+                continue
+            for item in sub.items:
+                if item.id == item_id:
+                    target, parent = item, sub
+                    break
+            if target is not None:
+                break
+        if target is None or parent is None:
+            return False, "⚠️ Позиция не найдена."
+
+        unit = (target.unit or "").lower()
+        step = 1.0 if unit in ("шт", "штук", "упак", "пучок", "вилок") else 0.5
+        qty = float(target.qty or 0)
+        name = target.raw_name
+        if action == "p":
+            target.qty = round(qty + step, 2)
+        elif action == "m":
+            new_qty = round(qty - step, 2)
+            if new_qty <= 0:
+                return False, "⚠️ Минимум — удалите позицию кнопкой 🗑."
+            target.qty = new_qty
+        elif action == "d":
+            parent.items.remove(target)  # delete-orphan → каскадное удаление
+        else:
+            return False, "⚠️ Неизвестное действие."
+
+        # Пересчёт подытога подзаказа и итога заказа
+        parent.subtotal_estimated = sum(
+            float(i.qty or 0) * float(i.price or 0) for i in parent.items
+        )
+        if not parent.items:
+            parent.status = SubOrderStatus.CANCELLED.value
+            parent.subtotal_estimated = 0
+        order.total_estimated = await self._recalc_total(session, order)
+        await session.flush()
+
+        active_items = [
+            i
+            for s in order.sub_orders
+            if s.status
+            not in (SubOrderStatus.REJECTED.value, SubOrderStatus.CANCELLED.value)
+            for i in s.items
+        ]
+        if not active_items:
+            await self.client_cancel(
+                session, order, reason="удалены все позиции", changed_by=changed_by
+            )
+            return True, "❌ Все позиции удалены — заказ отменён."
+
+        if action == "d":
+            note = f"🗑 {name} удалено"
+        else:
+            note = f"{name}: {target.qty:g} {target.unit or ''}".rstrip()
+        return True, note
+
 
     # ------------------------------------------------------------------
     # Оповещения продавцов
@@ -1104,6 +1197,56 @@ class OrderService:
                 PreorderLog(order_id=order.id, event=PreorderEvent.CANCELLED.value)
             )
             await session.flush()
+
+    async def admin_cancel(
+        self,
+        session: AsyncSession,
+        order: Order,
+        admin_id: int,
+        reason: str = "",
+    ) -> bool:
+        """A4: ручное вмешательство администратора — отмена на любом этапе.
+
+        В отличие от client_cancel не ограничивает статусы: администратор
+        вправе остановить заказ и в сборке, и в доставке. Возвращает False,
+        если заказ уже отменён или закрыт.
+        """
+        terminal = {
+            OrderStatus.CANCELLED.value,
+            OrderStatus.PREORDER_CANCELLED.value,
+            OrderStatus.DONE.value,
+        }
+        if order.status in terminal:
+            return False
+        self._scheduler.cancel_prefix(f"order:{order.id}:")
+        order.status = (
+            OrderStatus.PREORDER_CANCELLED.value
+            if order.order_type == OrderType.PREORDER.value
+            else OrderStatus.CANCELLED.value
+        )
+        for sub in order.sub_orders:
+            sub.status = SubOrderStatus.CANCELLED.value
+        await self._log_status(session, order, changed_by=admin_id)
+        await session.flush()
+        for sub in order.sub_orders:
+            if sub.shop:
+                await self._notifier.notify_shop(
+                    session,
+                    sub.shop,
+                    f"🛑 Заказ #{order.id} отменён администратором.",
+                )
+        await self._notifier.send(
+            session,
+            order.client.telegram_id,
+            f"🛑 Заказ #{order.id} отменён администратором."
+            + (f"\nПричина: {reason}" if reason else ""),
+        )
+        if order.order_type == OrderType.PREORDER.value:
+            session.add(
+                PreorderLog(order_id=order.id, event=PreorderEvent.CANCELLED.value)
+            )
+            await session.flush()
+        return True
 
     async def register_no_show(
         self, session: AsyncSession, order: Order, reason: str

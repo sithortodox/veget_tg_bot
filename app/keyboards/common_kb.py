@@ -51,10 +51,43 @@ def main_client_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="📝 Новый заказ")],
             [KeyboardButton(text="📦 Мои заказы")],
+            [KeyboardButton(text="🥕 Карточки товаров")],
             [KeyboardButton(text="👤 Профиль")],
             [KeyboardButton(text="🔁 Сменить роль")],
         ],
         resize_keyboard=True,
+    )
+
+
+def creg_confirm_keyboard() -> InlineKeyboardMarkup:
+    """§9.2: подтверждение точки после геокода адреса."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📍 Точка верна", callback_data="creg:ok"
+                ),
+                InlineKeyboardButton(
+                    text="📍 Указать вручную", callback_data="creg:manual"
+                ),
+            ]
+        ]
+    )
+
+
+def creg_accept_keyboard() -> InlineKeyboardMarkup:
+    """§9.3: расхождение текстового адреса и ручной точки."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Принять адрес", callback_data="creg:accept"
+                ),
+                InlineKeyboardButton(
+                    text="✏️ Ввести заново", callback_data="creg:reenter"
+                ),
+            ]
+        ]
     )
 
 

@@ -11,15 +11,12 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import Any
 
-import pytest_asyncio
 from aiogram import Bot, Dispatcher
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Chat
 from aiogram.types import Message as TgMessage
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
 from app.constants import (
     OrderStatus,
     PaymentMethod,
@@ -27,8 +24,6 @@ from app.constants import (
     SubOrderStatus,
 )
 from app.db.models import Order, SubOrder
-from app.handlers import iter_routers, register_routers
-from app.middlewares import DbSessionMiddleware, UserMiddleware
 from tests.conftest import make_product, make_shop, make_user
 from tests.services_fixture import ServiceStack
 
@@ -128,6 +123,18 @@ class E2EDriver:
         }
         await self.dp.feed_raw_update(bot=self.bot, update=raw)
 
+    async def location(self, user_id: int, lat: float, lon: float) -> None:
+        """Геолокация от пользователя (скрепка 📎 → Геопозиция)."""
+        self._update_id += 1
+        raw = {
+            "update_id": self._update_id,
+            "message": {
+                **self._base_message(user_id),
+                "location": {"latitude": lat, "longitude": lon},
+            },
+        }
+        await self.dp.feed_raw_update(bot=self.bot, update=raw)
+
     # --- Выходящие сообщения (перехваченные API-вызовы) ---
 
     def sent_texts(self, chat_id: int) -> list[str]:
@@ -138,6 +145,28 @@ class E2EDriver:
             m.text
             for m in self.api.calls
             if isinstance(m, SendMessage) and int(m.chat_id) == chat_id and m.text
+        ]
+
+    def sent_edits(self, chat_id: int) -> list[str]:
+        """Тексты сообщений, отредактированных ботом в указанном чате."""
+        from aiogram.methods import EditMessageText
+
+        return [
+            m.text
+            for m in self.api.calls
+            if isinstance(m, EditMessageText)
+            and int(m.chat_id or 0) == chat_id
+            and m.text
+        ]
+
+    def sent_pins(self, chat_id: int) -> list[tuple[float, float]]:
+        """Координаты точек (гео-пинов), отправленных ботом в чат."""
+        from aiogram.methods import SendLocation
+
+        return [
+            (m.latitude, m.longitude)
+            for m in self.api.calls
+            if isinstance(m, SendLocation) and int(m.chat_id) == chat_id
         ]
 
     def sent_photos(self, chat_id: int) -> list[str]:
@@ -167,26 +196,7 @@ class E2EDriver:
         return sub
 
 
-@pytest_asyncio.fixture
-async def e2e(db, stack) -> E2EDriver:
-    """Дискетчер с реальными роутерами/middleware и мок-ботом."""
-    settings = get_settings()
-    bot = Bot(token="42:TESTTOKEN")
-    bot.session = FakeTelegramSession()
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.update.middleware(DbSessionMiddleware(stack.session_factory))
-    dp.update.middleware(UserMiddleware(stack.registry, settings).__call__())
-    # Роутеры создаются один раз на модуль — перед повторным include
-    # снимаем привязку с предыдущего диспетчера (приватные поля aiogram,
-    # в тестах это осознанный обход «router already attached»)
-    for router in iter_routers():
-        parent = router._parent_router
-        if parent is not None:
-            if router in parent.sub_routers:
-                parent.sub_routers.remove(router)
-            router._parent_router = None
-    register_routers(dp)
-    return E2EDriver(dp=dp, bot=bot, api=bot.session, stack=stack, db=db)
+# Фикстура `e2e` определена в tests/conftest.py — она общая для всех E2E-модулей
 
 
 # ----------------------------------------------------------------------

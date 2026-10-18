@@ -14,12 +14,14 @@ from app.constants import ModerationStatus, Role
 from app.db.models import Shop, User
 from app.keyboards.common_kb import (
     contact_keyboard,
+    creg_accept_keyboard,
+    creg_confirm_keyboard,
     main_client_keyboard,
     main_courier_keyboard,
     main_seller_keyboard,
     role_keyboard,
 )
-from app.services.geo import GeoService
+from app.services.geo import GeoPoint, GeoService
 from app.services.registry import ServiceRegistry
 from app.states.client_states import ClientReg
 from app.states.courier_states import CourierReg
@@ -206,27 +208,98 @@ async def client_address(message: Message, state: FSMContext, data: dict) -> Non
         address_lon=result.point.lon,
         address_components=result.components,
     )
-    await _finish_client_reg(message, state, data)
+    # §9.2: показываем найденную точку и просим подтвердить
+    await state.set_state(ClientReg.confirm)
+    await message.answer_location(
+        latitude=result.point.lat, longitude=result.point.lon
+    )
+    await message.answer(
+        "📍 Проверьте точку на карте — это ваш адрес?",
+        reply_markup=creg_confirm_keyboard(),
+    )
 
 
 @router.message(ClientReg.geo, F.location)
 async def client_geo_point(message: Message, state: FSMContext, data: dict) -> None:
-    """Ручная точка (гео-точка от покупателя)."""
-    from app.services.geo import GeoPoint
-
+    """Ручная точка (гео-точка от покупателя), §9.3 — сверка с текстом."""
     lat = message.location.latitude
     lon = message.location.longitude
-    point = GeoPoint(lat=lat, lon=lon)
+    manual = GeoPoint(lat=lat, lon=lon)
+    fsm_data = await state.get_data()
+    text_lat = fsm_data.get("address_lat")
+    text_lon = fsm_data.get("address_lon")
+    if text_lat is not None and text_lon is not None:
+        # Есть и текстовый адрес, и ручная точка — проверяем расхождение
+        services: ServiceRegistry = _services(data)
+        geo: GeoService = services["geo"]
+        text_point = GeoPoint(lat=float(text_lat), lon=float(text_lon))
+        if not await geo.is_address_confirmed(text_point, manual):
+            await state.update_data(manual_lat=lat, manual_lon=lon)
+            await state.set_state(ClientReg.confirm)
+            await message.answer_location(latitude=lat, longitude=lon)
+            await message.answer(
+                "⚠️ Точка на карте заметно отличается от текстового адреса "
+                "(больше 500 м).\nПодтвердите адрес или введите его заново.",
+                reply_markup=creg_accept_keyboard(),
+            )
+            return
     await state.update_data(
-        address_geo=point.wkt, address_lat=lat, address_lon=lon
+        address_geo=manual.wkt, address_lat=lat, address_lon=lon
     )
     await _finish_client_reg(message, state, data)
 
 
+@router.callback_query(ClientReg.confirm, F.data == "creg:ok")
+async def creg_ok(cb: CallbackQuery, state: FSMContext, data: dict) -> None:
+    """§9.2: подтверждение геокодированной точки."""
+    await cb.answer()
+    await _finish_client_reg(cb.message, state, data, user=cb.from_user)
+
+
+@router.callback_query(ClientReg.confirm, F.data == "creg:manual")
+async def creg_manual(cb: CallbackQuery, state: FSMContext) -> None:
+    """§9.2: покупатель ставит точку вручную."""
+    await state.set_state(ClientReg.geo)
+    await cb.answer()
+    await cb.message.answer(
+        "Отправьте геолокацию (скрепка 📎 → Геопозиция)."
+    )
+
+
+@router.callback_query(ClientReg.confirm, F.data == "creg:accept")
+async def creg_accept(cb: CallbackQuery, state: FSMContext, data: dict) -> None:
+    """§9.3: покупатель подтверждает расхождение текста и точки."""
+    fsm_data = await state.get_data()
+    if fsm_data.get("manual_lat") is not None:
+        # Принимаем точку покупателя как более точную
+        manual = GeoPoint(
+            lat=float(fsm_data["manual_lat"]), lon=float(fsm_data["manual_lon"])
+        )
+        await state.update_data(
+            address_geo=manual.wkt,
+            address_lat=manual.lat,
+            address_lon=manual.lon,
+        )
+    await cb.answer()
+    await _finish_client_reg(cb.message, state, data, user=cb.from_user)
+
+
+@router.callback_query(ClientReg.confirm, F.data == "creg:reenter")
+async def creg_reenter(cb: CallbackQuery, state: FSMContext) -> None:
+    """§9.3: ввод адреса заново."""
+    await state.set_state(ClientReg.address)
+    await cb.answer()
+    await cb.message.answer("📍 Укажите адрес заново (улица, дом):")
+
+
 async def _finish_client_reg(
-    message: Message, state: FSMContext, data: dict
+    message: Message, state: FSMContext, data: dict, user=None
 ) -> None:
-    """Сохраняет профиль покупателя и показывает меню."""
+    """Сохраняет профиль покупателя и показывает меню.
+
+    user — Telegram-пользователь, нажавший кнопку (для callback-потока
+    message.from_user оказался бы ботом).
+    """
     session: AsyncSession = data["session"]
     db_user: User = data["db_user"]
     fsm_data = await state.get_data()
@@ -236,8 +309,9 @@ async def _finish_client_reg(
     db_user.address_text = fsm_data.get("address_text") or db_user.address_text
     db_user.address_geo = fsm_data.get("address_geo") or db_user.address_geo
     db_user.address_components = fsm_data.get("address_components")
-    if db_user.name is None and message.from_user:
-        db_user.name = message.from_user.full_name
+    source_user = user or message.from_user
+    if db_user.name is None and source_user:
+        db_user.name = source_user.full_name
     await session.flush()
     await state.clear()
     await message.answer(

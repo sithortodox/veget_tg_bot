@@ -9,6 +9,7 @@ class ClientReg(StatesGroup):
     phone = State()
     address = State()
     geo = State()
+    confirm = State()  # подтверждение точки на карте (§9.2/§9.3)
 
 
 class ClientOrder(StatesGroup):

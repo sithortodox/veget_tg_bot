@@ -116,3 +116,48 @@ def profile_keyboard() -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def order_edit_keyboard(order) -> InlineKeyboardMarkup:
+    """C7: редактор позиций предзаказа (± количество, удаление, замена)."""
+    from app.constants import SubOrderStatus
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for sub in order.sub_orders:
+        if sub.status in (
+            SubOrderStatus.REJECTED.value,
+            SubOrderStatus.CANCELLED.value,
+        ):
+            continue
+        for item in sub.items:
+            name = (item.raw_name or "?")[:18]
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"➕ {name}",
+                        callback_data=f"ei:{order.id}:{item.id}:p",
+                    ),
+                    InlineKeyboardButton(
+                        text=f"➖ {name}",
+                        callback_data=f"ei:{order.id}:{item.id}:m",
+                    ),
+                    InlineKeyboardButton(
+                        text="🗑", callback_data=f"ei:{order.id}:{item.id}:d"
+                    ),
+                ]
+            )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="✏️ Заменить списком", callback_data=f"erpl:{order.id}"
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="✅ Готово", callback_data=f"edone:{order.id}"
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)

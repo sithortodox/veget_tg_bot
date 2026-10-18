@@ -161,3 +161,40 @@ async def make_product(
     db.add(product)
     await db.flush()
     return product
+
+
+# ----------------------------------------------------------------------
+# E2E-драйвер: реальный Dispatcher + мок-бот Telegram
+# (общая фикстура для всех E2E-модулей, чтобы не дублировать)
+# ----------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def e2e(db, stack):
+    """Дискетчер с реальными роутерами/middleware и мок-ботом."""
+    # Импорт внутри фикстуры — tests.test_e2e импортирует этот conftest
+    from aiogram import Bot, Dispatcher
+    from aiogram.fsm.storage.memory import MemoryStorage
+
+    from app.config import get_settings
+    from app.handlers import iter_routers, register_routers
+    from app.middlewares import DbSessionMiddleware, UserMiddleware
+    from tests.test_e2e import E2EDriver, FakeTelegramSession
+
+    settings = get_settings()
+    bot = Bot(token="42:TESTTOKEN")
+    bot.session = FakeTelegramSession()
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.update.middleware(DbSessionMiddleware(stack.session_factory))
+    dp.update.middleware(UserMiddleware(stack.registry, settings).__call__())
+    # Роутеры создаются один раз на модуль — перед повторным include
+    # снимаем привязку с предыдущего диспетчера (приватные поля aiogram,
+    # в тестах это осознанный обход «router already attached»)
+    for router in iter_routers():
+        parent = router._parent_router
+        if parent is not None:
+            if router in parent.sub_routers:
+                parent.sub_routers.remove(router)
+            router._parent_router = None
+    register_routers(dp)
+    return E2EDriver(dp=dp, bot=bot, api=bot.session, stack=stack, db=db)
