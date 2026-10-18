@@ -17,7 +17,8 @@ from app.config import Settings
 
 logger = logging.getLogger(__name__)
 
-# Regex: количество + единица. Поддерживает «5 кг», «3кг», «2 кило», «10 шт»
+# Regex: количество + единица. Поддерживает «5 кг», «3кг», «2 кило», «10 шт»,
+# числительные словами («один банан», «два кг огурцов») и «полкило»
 _QTY_RE = re.compile(
     r"(?P<qty>\d+(?:[.,]\d+)?)\s*(?P<unit>кг|килограмм\w*|кило|кг\.|г|грамм\w*|шт|штук\w*|"
     r"упаков\w*|пачек|пачка|пучк\w*|вилк\w*|ящик\w*|литр\w*|л\.?)",
@@ -59,6 +60,64 @@ _UNIT_MAP: dict[str, str] = {
     "литров": "л",
     "л": "л",
 }
+
+# Счётные числительные словами («один банан», «два кг огурцов», «пара яблок»)
+_NUM_WORDS: dict[str, float] = {
+    "ноль": 0,
+    "один": 1,
+    "одна": 1,
+    "одно": 1,
+    "два": 2,
+    "две": 2,
+    "три": 3,
+    "четыре": 4,
+    "пять": 5,
+    "шесть": 6,
+    "семь": 7,
+    "восемь": 8,
+    "девять": 9,
+    "десять": 10,
+    "одиннадцать": 11,
+    "двенадцать": 12,
+    "тринадцать": 13,
+    "четырнадцать": 14,
+    "пятнадцать": 15,
+    "шестнадцать": 16,
+    "семнадцать": 17,
+    "восемнадцать": 18,
+    "девятнадцать": 19,
+    "двадцать": 20,
+    "тридцать": 30,
+    "сорок": 40,
+    "пятьдесят": 50,
+    "шестьдесят": 60,
+    "семьдесят": 70,
+    "восемьдесят": 80,
+    "девяносто": 90,
+    "сто": 100,
+    "пара": 2,
+    "полтора": 1.5,
+    "полторы": 1.5,
+    "дюжина": 12,
+}
+
+# Альтернации от длинных к коротким — иначе «два» сработает внутри «двадцать»
+_NUM_ALT = "|".join(sorted((re.escape(w) for w in _NUM_WORDS), key=len, reverse=True))
+_UNIT_ALT = "|".join(sorted((re.escape(u) for u in _UNIT_MAP), key=len, reverse=True))
+
+# Числительное словом + необязательная единица: «один банан», «два кг огурцов»;
+# составные вроде «тридцать два» складываются, «кг/шт» потребляется как единица
+_WORD_QTY_RE = re.compile(
+    rf"\b(?P<num>{_NUM_ALT})\b\s*(?:\b(?P<num2>{_NUM_ALT})\b)?\s*"
+    rf"(?:\b(?P<u>{_UNIT_ALT})\b)?",
+    re.IGNORECASE,
+)
+
+# «полкило», «пол кг», «пол-килограмма» → 0.5 кг
+_HALF_KG_RE = re.compile(
+    r"\bпол\s*-?\s*(?:кило(?:грамм(?:а|ов)?)?|кг)\b",
+    re.IGNORECASE,
+)
 
 _LLM_PROMPT = (
     "Ты парсер списка продуктов. Извлеки позиции из текста. "
@@ -157,23 +216,46 @@ class ProductParser:
             chunk = chunk.strip().strip(".")
             if not chunk:
                 continue
-            qty: Optional[float] = None
-            unit: Optional[str] = None
-            name = chunk
-            m = _QTY_RE.search(chunk)
-            if m:
-                raw_qty = float(m.group("qty").replace(",", "."))
-                raw_unit = m.group("unit").lower().rstrip(".")
-                unit = _UNIT_MAP.get(raw_unit, raw_unit)
-                # граммы → кг
-                if unit == "кг" and raw_unit in {"г", "грамм", "грамма", "граммов"}:
-                    raw_qty = raw_qty / 1000
-                qty = raw_qty
-                name = (chunk[: m.start()] + chunk[m.end() :]).strip(" ,.-")
-                if not name:
-                    name = chunk
+            qty, unit, name = self._extract_qty(chunk)
             result.append(ParsedPosition(raw=name, qty=qty, unit=unit, normalized=name))
         return result
+
+    @staticmethod
+    def _extract_qty(chunk: str) -> tuple[Optional[float], Optional[str], str]:
+        """Разбирает количество/единицу в куске: цифры → полслова → словом.
+
+        Возвращает (qty, unit, название); unit нормализован к products.unit,
+        граммы приводятся к кг. Название — кусок без числительного/единицы.
+        """
+        m = _QTY_RE.search(chunk)
+        if m:
+            raw_qty = float(m.group("qty").replace(",", "."))
+            raw_unit = m.group("unit").lower().rstrip(".")
+            unit = _UNIT_MAP.get(raw_unit, raw_unit)
+            # граммы → кг
+            if unit == "кг" and raw_unit in {"г", "грамм", "грамма", "граммов"}:
+                raw_qty = raw_qty / 1000
+            name = (chunk[: m.start()] + chunk[m.end() :]).strip(" ,.-")
+            return raw_qty, unit, name or chunk
+
+        m = _HALF_KG_RE.search(chunk)
+        if m:
+            name = (chunk[: m.start()] + chunk[m.end() :]).strip(" ,.-")
+            return 0.5, "кг", name or chunk
+
+        m = _WORD_QTY_RE.search(chunk)
+        if m:
+            qty = _NUM_WORDS[m.group("num").lower()]
+            if m.group("num2"):
+                qty += _NUM_WORDS[m.group("num2").lower()]
+            raw_unit = (m.group("u") or "").lower()
+            unit = _UNIT_MAP.get(raw_unit) if raw_unit else None
+            if unit == "кг" and raw_unit in {"г", "грамм", "грамма", "граммов"}:
+                qty = qty / 1000
+            name = (chunk[: m.start()] + chunk[m.end() :]).strip(" ,.-")
+            return qty, unit, name or chunk
+
+        return None, None, chunk
 
     async def _llm_parse(self, text: str) -> list[ParsedPosition]:
         """Запрос к LLM и разбор ответа в позиции."""

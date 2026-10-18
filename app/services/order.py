@@ -54,6 +54,10 @@ from app.services.scheduler import (
 
 logger = logging.getLogger(__name__)
 
+# Единицы веса/объёма: счётная форма без единицы («один банан») для них
+# неоднозначна — покупателя просим уточнить шт или вес (§8)
+_WEIGHT_UNITS = {"кг", "г", "л", "литр", "килограмм"}
+
 
 def utcnow() -> datetime:
     """Текущее время UTC."""
@@ -201,6 +205,27 @@ class OrderService:
             return None, (
                 "😕 Ни одна позиция не найдена на витринах рядом с вами.\n"
                 "Проверьте названия или попробуйте другой список."
+            )
+
+        # 5.1 Уточнение единиц: посчитали штуками, а товар весовой (§8)
+        ambiguous = [
+            m
+            for m in found
+            if m.position.unit is None
+            and m.position.qty is not None
+            and (m.product.unit or "").lower() in _WEIGHT_UNITS
+        ]
+        if ambiguous:
+            lines = "\n".join(
+                f"• {m.position.raw} — {m.position.qty:g}" for m in ambiguous[:5]
+            )
+            unit0 = ambiguous[0].product.unit or "кг"
+            return None, (
+                "⚠️ Уточните единицы измерения:\n"
+                f"{lines}\n"
+                f"Этот товар продаётся в единицах «{unit0}». Напишите точнее, "
+                "например «бананы 0.5 кг» или «бананы 3 шт», "
+                "и пришлите список ещё раз."
             )
 
         # 6. Группировка по магазинам → подзаказы
