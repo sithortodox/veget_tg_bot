@@ -52,6 +52,7 @@ def main_client_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📝 Новый заказ")],
             [KeyboardButton(text="📦 Мои заказы")],
             [KeyboardButton(text="👤 Профиль")],
+            [KeyboardButton(text="🔁 Сменить роль")],
         ],
         resize_keyboard=True,
     )
@@ -64,6 +65,7 @@ def main_seller_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📥 Заказы")],
             [KeyboardButton(text="🥕 Моя витрина")],
             [KeyboardButton(text="👤 Профиль магазина")],
+            [KeyboardButton(text="🔁 Сменить роль")],
         ],
         resize_keyboard=True,
     )
@@ -75,6 +77,7 @@ def main_courier_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="🛵 Мои доставки")],
             [KeyboardButton(text="👤 Профиль")],
+            [KeyboardButton(text="🔁 Сменить роль")],
         ],
         resize_keyboard=True,
     )

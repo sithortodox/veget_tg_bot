@@ -37,8 +37,8 @@ async def cmd_admin(message: Message, data: dict) -> None:
         "🛡 Админ-панель\n"
         "/astats — статистика\n"
         "/ausers — пользователи\n"
-        "/aban <telegram_id> — бан\n"
-        "/aunban <telegram_id> — разбан"
+        "/aban &lt;telegram_id&gt; — бан\n"
+        "/aunban &lt;telegram_id&gt; — разбан"
     )
 
 
@@ -91,7 +91,7 @@ async def cmd_ban(message: Message, data: dict) -> None:
         return
     parts = (message.text or "").split()
     if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("Использование: /aban <telegram_id> [причина]")
+        await message.answer("Использование: /aban &lt;telegram_id&gt; [причина]")
         return
     session: AsyncSession = data["session"]
     services: ServiceRegistry = data["services"]
@@ -116,7 +116,7 @@ async def cmd_unban(message: Message, data: dict) -> None:
         return
     parts = (message.text or "").split()
     if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("Использование: /aunban <telegram_id>")
+        await message.answer("Использование: /aunban &lt;telegram_id&gt;")
         return
     session: AsyncSession = data["session"]
     services: ServiceRegistry = data["services"]

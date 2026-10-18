@@ -87,6 +87,13 @@ async def cmd_help(message: Message) -> None:
 # ----------------------------------------------------------------------
 
 
+@router.message(F.text == "🔁 Сменить роль")
+async def switch_role(message: Message, state: FSMContext) -> None:
+    """Возврат к выбору роли из любого меню (G1)."""
+    await state.clear()
+    await message.answer("Выберите роль:", reply_markup=role_keyboard())
+
+
 @router.callback_query(F.data == "role:client")
 async def role_client(
     cb: CallbackQuery, state: FSMContext, db_user: User, data: dict
@@ -94,6 +101,7 @@ async def role_client(
     """Покупатель: доводим регистрацию или показываем меню."""
     await cb.answer()
     if db_user.address_geo and db_user.phone:
+        db_user.role = Role.CLIENT.value
         await cb.message.edit_text("Готово к заказам! Пришлите список продуктов 👇")
         await cb.message.answer(
             "Например: «капуста 2 кг, помидоры 1 кг, банан»",
