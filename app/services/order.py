@@ -984,6 +984,41 @@ class OrderService:
                     break
             if sent >= 3:
                 break
+
+        # Магазины: заказ собран — ждём выдачи/оплаты (S7/S8, §5.3).
+        # В мультимагазине «Получил оплату» закрыл бы весь заказ целиком,
+        # поэтому там даём только «Выдал» по своему подзаказу (s:g:).
+        from app.keyboards.seller_kb import (
+            payment_confirm_keyboard,
+            sub_issued_keyboard,
+        )
+
+        ready_subs = [
+            s
+            for s in order.sub_orders
+            if s.status == SubOrderStatus.READY.value and s.shop
+        ]
+        for s in ready_subs:
+            if order.delivery_type in (DeliveryType.PICKUP.value, None):
+                kb = (
+                    payment_confirm_keyboard(order.id, s.id)
+                    if len(ready_subs) == 1
+                    else sub_issued_keyboard(order.id, s.id)
+                )
+                await self._notifier.notify_shop(
+                    session,
+                    s.shop,
+                    f"✅ Заказ #{order.id} собран. Ожидайте покупателя — "
+                    "отметьте выдачу/оплату кнопкой ниже.",
+                    keyboard=kb,
+                )
+            else:
+                await self._notifier.notify_shop(
+                    session,
+                    s.shop,
+                    f"✅ Заказ #{order.id} собран — курьер заберёт и доставит.",
+                )
+
         # Таймер получения/оплаты
         self._scheduler.schedule_once(
             job_id_pickup(order.id),
@@ -1132,6 +1167,46 @@ class OrderService:
             order.client.telegram_id,
             "👍 Отлично! Передал продавцу — он подтвердит получение оплаты.",
         )
+
+    async def client_refused_payment(
+        self, session: AsyncSession, order: Order, changed_by: Optional[int] = None
+    ) -> bool:
+        """Покупатель отказался оплачивать после сборки (§5.4) → бан-логика.
+
+        Возвращает False, если заказ уже не в статусе «собран».
+        """
+        if order.status != OrderStatus.READY.value:
+            return False
+        self._scheduler.cancel(job_id_pickup(order.id))
+        order.status = OrderStatus.REFUSED_PAYMENT.value
+        order.payment_status = PaymentStatus.REFUSED.value
+        for sub in order.sub_orders:
+            if sub.status == SubOrderStatus.READY.value:
+                sub.status = SubOrderStatus.CANCELLED.value
+        await self._log_status(session, order, changed_by=changed_by)
+        await session.flush()
+        for sub in order.sub_orders:
+            if sub.shop:
+                await self._notifier.notify_shop(
+                    session,
+                    sub.shop,
+                    f"❌ Покупатель отказался оплачивать заказ #{order.id}.",
+                )
+        await self._notifier.send(
+            session,
+            order.client.telegram_id,
+            f"❌ Заказ #{order.id} закрыт: отказ от оплаты.",
+        )
+        # Санкция по бан-логике 4 уровней (§5.4)
+        client = await session.get(User, order.client_id)
+        if client is not None:
+            await self._ban.register_violation(
+                session,
+                client,
+                reason="отказ от оплаты после сборки",
+                order_id=order.id,
+            )
+        return True
 
     async def seller_confirmed_payment(
         self, session: AsyncSession, order: Order, changed_by: Optional[int] = None

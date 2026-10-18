@@ -59,7 +59,7 @@ def payment_keyboard(order_id: int) -> InlineKeyboardMarkup:
 
 
 def ready_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    """Заказ собран: подтверждение оплаты покупателем + отмена."""
+    """Заказ собран: оплата или отказ (§5.4; отмена доступна только до сборки)."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -69,7 +69,7 @@ def ready_keyboard(order_id: int) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="❌ Отменить заказ", callback_data=f"oc:{order_id}"
+                    text="❌ Не буду оплачивать", callback_data=f"orf:{order_id}"
                 )
             ],
         ]

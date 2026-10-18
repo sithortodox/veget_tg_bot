@@ -51,7 +51,7 @@ async def menu_deliveries(message: Message, data: dict) -> None:
         client_addr = order.client.address_text if order.client else "—"
         lines.append(f"🏠 {order.delivery_address or client_addr}")
         await message.answer(
-            "\n".join(lines), keyboard=courier_order_keyboard(order.id)
+            "\n".join(lines), reply_markup=courier_order_keyboard(order.id)
         )
 
 

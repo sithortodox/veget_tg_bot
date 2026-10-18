@@ -600,6 +600,27 @@ async def order_paid_by_client(cb: CallbackQuery, data: dict) -> None:
     await cb.message.edit_text("✅ Спасибо! Продавец подтвердит получение оплаты.")
 
 
+@router.callback_query(F.data.startswith("orf:"))
+async def order_refused_by_client(cb: CallbackQuery, data: dict) -> None:
+    """Отказ от оплаты после сборки (§5.4) → статус + бан-логика."""
+    services: ServiceRegistry = data["services"]
+    session: AsyncSession = data["session"]
+    orders: OrderService = services["orders"]
+    order_id = int(cb.data.split(":")[1])
+    order = await orders.get_order(session, order_id)
+    ok = False
+    if order is not None:
+        ok = await orders.client_refused_payment(
+            session, order, changed_by=cb.from_user.id
+        )
+    await cb.answer("Отказ зафиксирован" if ok else "Заказ уже закрыт")
+    await cb.message.edit_text(
+        f"❌ Заказ #{order_id} закрыт: вы отказались от оплаты."
+        if ok
+        else f"Заказ #{order_id} уже в другом статусе."
+    )
+
+
 # ----------------------------------------------------------------------
 # Повтор заказа (C12)
 # ----------------------------------------------------------------------

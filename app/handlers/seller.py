@@ -13,11 +13,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.constants import VALID_UNITS, SubOrderStatus
-from app.db.models import Order, Product, Shop, SubOrder
+from app.constants import VALID_UNITS, OrderStatus, OrderType, SubOrderStatus
+from app.db.models import Order, OrderItem, Product, Shop, SubOrder
 from app.keyboards.common_kb import main_seller_keyboard
 from app.keyboards.seller_kb import (
     orders_list_keyboard,
+    sub_card_keyboard,
 )
 from app.services.catalog_import import import_catalog_rows, parse_catalog_rows
 from app.services.order import OrderService
@@ -42,36 +43,63 @@ async def _get_shop(session: AsyncSession, telegram_id: int) -> Optional[Shop]:
 # ----------------------------------------------------------------------
 
 
-@router.message(F.text == "📥 Заказы")
-async def menu_orders(message: Message, data: dict) -> None:
-    """Активные заказы магазина (S7)."""
-    session: AsyncSession = data["session"]
-    shop = await _get_shop(session, message.from_user.id)
-    if shop is None:
-        await message.answer("Магазин не найден. /start → «Я магазин».")
-        return
-    result = await session.execute(
-        select(SubOrder)
-        .where(SubOrder.shop_id == shop.id)
-        .where(
-            SubOrder.status.in_(
-                [
-                    SubOrderStatus.PENDING.value,
-                    SubOrderStatus.CONFIRMED.value,
-                    SubOrderStatus.ASSEMBLING.value,
-                    SubOrderStatus.READY.value,
-                ]
-            )
+_ACTIVE_SUB_STATUSES = [
+    SubOrderStatus.PENDING.value,
+    SubOrderStatus.CONFIRMED.value,
+    SubOrderStatus.ASSEMBLING.value,
+    SubOrderStatus.READY.value,
+    SubOrderStatus.PICKED_UP.value,
+]
+_HISTORY_SUB_STATUSES = [
+    SubOrderStatus.DONE.value,
+    SubOrderStatus.REJECTED.value,
+    SubOrderStatus.CANCELLED.value,
+]
+_PREORDER_ORDER_STATUSES = [
+    OrderStatus.PREORDER_PENDING.value,
+    OrderStatus.PREORDER_REMINDED.value,
+    OrderStatus.PREORDER_CONFIRMED.value,
+    OrderStatus.PREORDER_SEARCHING.value,
+]
+
+
+async def _orders_list_view(
+    session: AsyncSession, shop: Shop, tab: str
+) -> tuple[str, object]:
+    """Текст + клавиатура для вкладки списка заказов (S7)."""
+    if tab == "preorder":
+        stmt = (
+            select(SubOrder)
+            .join(SubOrder.order)
+            .where(SubOrder.shop_id == shop.id)
+            .where(Order.order_type == OrderType.PREORDER.value)
+            .where(Order.status.in_(_PREORDER_ORDER_STATUSES))
+            .options(selectinload(SubOrder.order).selectinload(Order.client))
+            .order_by(SubOrder.created_at.desc())
         )
-        .options(selectinload(SubOrder.order).selectinload(Order.client))
-        .order_by(SubOrder.created_at.desc())
-    )
-    subs = list(result.scalars().all())
-    if not subs:
-        await message.answer("📭 Активных заказов нет.")
-        return
+        title = "📅 Предзаказы:"
+    elif tab == "history":
+        stmt = (
+            select(SubOrder)
+            .where(SubOrder.shop_id == shop.id)
+            .where(SubOrder.status.in_(_HISTORY_SUB_STATUSES))
+            .options(selectinload(SubOrder.order).selectinload(Order.client))
+            .order_by(SubOrder.created_at.desc())
+            .limit(10)
+        )
+        title = "🗂 История (последние 10):"
+    else:
+        stmt = (
+            select(SubOrder)
+            .where(SubOrder.shop_id == shop.id)
+            .where(SubOrder.status.in_(_ACTIVE_SUB_STATUSES))
+            .options(selectinload(SubOrder.order).selectinload(Order.client))
+            .order_by(SubOrder.created_at.desc())
+        )
+        title = "📥 Активные позиции:"
+    subs = list((await session.execute(stmt)).scalars())
+    lines = [title]
     pairs: list[tuple[int, str]] = []
-    lines = ["📥 Активные позиции:"]
     for sub in subs:
         client = sub.order.client if sub.order else None
         name = client.name if client else "?"
@@ -80,8 +108,102 @@ async def menu_orders(message: Message, data: dict) -> None:
             f"~{float(sub.subtotal_estimated or 0):.0f} ₽"
         )
         pairs.append((sub.id, f"Заказ #{sub.order_id} ({sub.status})"))
-    lines.append("\nОткройте позицию кнопкой ниже.")
-    await message.answer("\n".join(lines), reply_markup=orders_list_keyboard(pairs))
+    if not pairs:
+        lines.append("Пусто.")
+    else:
+        lines.append("\nОткройте позицию кнопкой ниже.")
+    return "\n".join(lines), orders_list_keyboard(pairs, tab=tab)
+
+
+@router.message(F.text == "📥 Заказы")
+async def menu_orders(message: Message, data: dict) -> None:
+    """Заказы магазина с вкладками (S7)."""
+    session: AsyncSession = data["session"]
+    shop = await _get_shop(session, message.from_user.id)
+    if shop is None:
+        await message.answer("Магазин не найден. /start → «Я магазин».")
+        return
+    text, kb = await _orders_list_view(session, shop, "active")
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("s:tab:"))
+async def seller_orders_tab(cb: CallbackQuery, data: dict) -> None:
+    """Переключение вкладки списка заказов (S7)."""
+    session: AsyncSession = data["session"]
+    shop = await _get_shop(session, cb.from_user.id)
+    if shop is None:
+        await cb.answer("Магазин не найден", show_alert=True)
+        return
+    tab = cb.data.split(":")[2]
+    text, kb = await _orders_list_view(session, shop, tab)
+    await cb.answer()
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except Exception:  # noqa: BLE001 — содержимое не изменилось, не роняем UX
+        await cb.message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("s:open:"))
+async def seller_open_sub(cb: CallbackQuery, data: dict) -> None:
+    """Карточка подзазаза: состав, факт, контакты покупателя (S10)."""
+    session: AsyncSession = data["session"]
+    sub_id = int(cb.data.split(":")[2])
+    result = await session.execute(
+        select(SubOrder)
+        .where(SubOrder.id == sub_id)
+        .options(
+            selectinload(SubOrder.order).selectinload(Order.client),
+            selectinload(SubOrder.items).selectinload(OrderItem.product),
+        )
+    )
+    sub = result.scalar_one_or_none()
+    if sub is None:
+        await cb.answer("Подзаказ не найден", show_alert=True)
+        return
+    shop = await _get_shop(session, cb.from_user.id)
+    if shop is None or sub.shop_id != shop.id:
+        await cb.answer("Это не ваш заказ", show_alert=True)
+        return
+    order = sub.order
+    client = order.client if order else None
+    lines = [f"📦 Заказ #{sub.order_id} · {sub.status}"]
+    if (
+        order is not None
+        and order.order_type == OrderType.PREORDER.value
+        and order.scheduled_at
+    ):
+        lines.append(f"📅 На дату: {order.scheduled_at:%d.%m.%Y %H:%M} UTC")
+    lines.append("🛒 Состав:")
+    for item in sub.items:
+        plan = f"{float(item.qty or 0):g} {item.unit or ''}".strip()
+        fact = (
+            f" (факт {float(item.actual_qty):g})"
+            if item.actual_qty is not None
+            else ""
+        )
+        lines.append(f"• {item.raw_name} — {plan}{fact}")
+    shown_total = float(
+        sub.subtotal_actual
+        if sub.subtotal_actual is not None
+        else sub.subtotal_estimated or 0
+    )
+    lines.append(f"💰 {'Итого' if sub.subtotal_actual is not None else '~'}: {shown_total:.0f} ₽")
+    if order is not None:
+        is_pickup = order.delivery_type in ("pickup", None)
+        lines.append(f"🚶 Получение: {'самовывоз' if is_pickup else 'доставка курьером'}")
+        addr = order.delivery_address or (
+            client.address_text if client else None
+        )
+        if addr:
+            lines.append(f"🏠 Адрес: {addr}")
+    if client is not None:
+        lines.append(f"👤 {client.name or '—'} · 📱 {client.phone or '—'}")
+    await cb.answer()
+    await cb.message.edit_text(
+        "\n".join(lines),
+        reply_markup=sub_card_keyboard(sub.id, sub.order_id, sub.status),
+    )
 
 
 @router.message(F.text == "🥕 Моя витрина")
